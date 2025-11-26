@@ -1356,6 +1356,7 @@ dependencies = [
  "forge_domain",
  "forge_fs",
  "forge_select",
+ "forge_services",
  "forge_spinner",
  "forge_tracker",
  "forge_walker",
@@ -1443,6 +1444,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "crossterm 0.28.1",
  "dashmap",
  "derive_setters",
  "fake",
@@ -1507,6 +1509,7 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "url",
+ "uuid",
 ]
 
 [[package]]

@@ -567,6 +567,14 @@ mod env_tests {
         fn get_env_var(&self, key: &str) -> Option<String> {
             self.env_vars.get(key).cloned()
         }
+
+        fn get_editor_command(&self) -> String {
+            "nano".to_string()
+        }
+
+        fn get_shell(&self) -> String {
+            "/bin/bash".to_string()
+        }
     }
 
     #[async_trait::async_trait]
@@ -910,6 +918,14 @@ mod env_tests {
 
             fn get_env_var(&self, key: &str) -> Option<String> {
                 self.env_vars.get(key).cloned()
+            }
+
+            fn get_editor_command(&self) -> String {
+                "nano".to_string()
+            }
+
+            fn get_shell(&self) -> String {
+                "/bin/bash".to_string()
             }
         }
 

@@ -113,6 +113,14 @@ mod tests {
         fn get_env_var(&self, _key: &str) -> Option<String> {
             None
         }
+
+        fn get_editor_command(&self) -> String {
+            "nano".to_string()
+        }
+
+        fn get_shell(&self) -> String {
+            "/bin/bash".to_string()
+        }
     }
 
     #[async_trait::async_trait]
