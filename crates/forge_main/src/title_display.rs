@@ -7,18 +7,12 @@ use forge_domain::{Category, TitleFormat};
 /// Implementation of Display for TitleFormat in the presentation layer
 pub struct TitleDisplay {
     inner: TitleFormat,
-    with_timestamp: bool,
     with_colors: bool,
 }
 
 impl TitleDisplay {
     pub fn new(title: TitleFormat) -> Self {
-        Self { inner: title, with_timestamp: true, with_colors: true }
-    }
-
-    pub fn with_timestamp(mut self, with_timestamp: bool) -> Self {
-        self.with_timestamp = with_timestamp;
-        self
+        Self { inner: title, with_colors: true }
     }
 
     pub fn with_colors(mut self, with_colors: bool) -> Self {
@@ -33,21 +27,16 @@ impl TitleDisplay {
             Category::Action => "⏺".yellow(),
             Category::Info => "⏺".white(),
             Category::Debug => "⏺".cyan(),
-            Category::Error => "⏺".red(),
+            Category::Error => "❌".red(),
             Category::Completion => "⏺".yellow(),
+            Category::Warning => "⚠️".bright_yellow(),
         };
 
         buf.push_str(format!("{icon} ").as_str());
 
-        // Add timestamp if requested
-        if self.with_timestamp {
-            buf.push_str(
-                format!("[{}] ", Local::now().format("%H:%M:%S"))
-                    .dimmed()
-                    .to_string()
-                    .as_str(),
-            );
-        }
+        let local_time: chrono::DateTime<Local> = self.inner.timestamp.into();
+        let timestamp_str = format!("[{}] ", local_time.format("%H:%M:%S"));
+        buf.push_str(timestamp_str.dimmed().to_string().as_str());
 
         let title = match self.inner.category {
             Category::Action => self.inner.title.white(),
@@ -55,6 +44,9 @@ impl TitleDisplay {
             Category::Debug => self.inner.title.dimmed(),
             Category::Error => format!("{} {}", "ERROR:".bold(), self.inner.title).red(),
             Category::Completion => self.inner.title.white().bold(),
+            Category::Warning => {
+                format!("{} {}", "WARNING:".bold(), self.inner.title).bright_yellow()
+            }
         };
 
         buf.push_str(title.to_string().as_str());
@@ -71,10 +63,9 @@ impl TitleDisplay {
 
         buf.push_str("⏺ ");
 
-        // Add timestamp if requested
-        if self.with_timestamp {
-            buf.push_str(format!("[{}] ", Local::now().format("%H:%M:%S")).as_str());
-        }
+        let local_time: chrono::DateTime<Local> = self.inner.timestamp.into();
+        let timestamp_str = format!("[{}] ", local_time.format("%H:%M:%S"));
+        buf.push_str(&timestamp_str);
 
         buf.push_str(&self.inner.title);
 
@@ -100,7 +91,6 @@ impl fmt::Display for TitleDisplay {
 pub trait TitleDisplayExt {
     fn display(self) -> TitleDisplay;
     fn display_with_colors(self, with_colors: bool) -> TitleDisplay;
-    fn display_with_timestamp(self, with_timestamp: bool) -> TitleDisplay;
 }
 
 impl TitleDisplayExt for TitleFormat {
@@ -110,9 +100,5 @@ impl TitleDisplayExt for TitleFormat {
 
     fn display_with_colors(self, with_colors: bool) -> TitleDisplay {
         TitleDisplay::new(self).with_colors(with_colors)
-    }
-
-    fn display_with_timestamp(self, with_timestamp: bool) -> TitleDisplay {
-        TitleDisplay::new(self).with_timestamp(with_timestamp)
     }
 }

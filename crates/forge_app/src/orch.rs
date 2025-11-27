@@ -5,17 +5,18 @@ use std::time::Duration;
 
 use async_recursion::async_recursion;
 use derive_setters::Setters;
-use forge_domain::*;
+use forge_domain::{Agent, *};
 use forge_template::Element;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::TemplateEngine;
 use crate::agent::AgentService;
 use crate::compact::Compactor;
 use crate::title_generator::TitleGenerator;
 
 #[derive(Clone, Setters)]
-#[setters(into, strip_option)]
+#[setters(into)]
 pub struct Orchestrator<S> {
     services: Arc<S>,
     sender: Option<ArcSender>,
@@ -118,10 +119,7 @@ impl<S: AgentService> Orchestrator<S> {
     // Returns if agent supports tool or not.
     fn is_tool_supported(&self) -> anyhow::Result<bool> {
         let agent = &self.agent;
-        let model_id = agent
-            .model
-            .as_ref()
-            .ok_or(Error::MissingModel(agent.id.clone()))?;
+        let model_id = &agent.model;
 
         // Check if at agent level tool support is defined
         let tool_supported = match agent.tool_supported {
@@ -163,7 +161,7 @@ impl<S: AgentService> Orchestrator<S> {
             .chat_agent(
                 model_id,
                 transformers.transform(context),
-                self.agent.provider,
+                Some(self.agent.provider.clone()),
             )
             .await?;
 
@@ -178,9 +176,8 @@ impl<S: AgentService> Orchestrator<S> {
             && let Some(compact) = agent.compact.clone()
         {
             info!(agent_id = %agent.id, "Compaction needed");
-            Compactor::new(self.services.clone(), compact)
+            Compactor::new(compact, self.environment.clone())
                 .compact(context.clone(), false)
-                .await
                 .map(Some)
         } else {
             debug!(agent_id = %agent.id, "Compaction not needed");
@@ -194,7 +191,6 @@ impl<S: AgentService> Orchestrator<S> {
 
         debug!(
             conversation_id = %self.conversation.id.clone(),
-            event_name = %event.name,
             event_value = %format!("{:?}", event.value),
             "Dispatching event"
         );
@@ -206,7 +202,7 @@ impl<S: AgentService> Orchestrator<S> {
             "Initializing agent"
         );
 
-        let model_id = self.get_model()?;
+        let model_id = self.get_model();
 
         let mut context = self.conversation.context.clone().unwrap_or_default();
 
@@ -228,7 +224,7 @@ impl<S: AgentService> Orchestrator<S> {
             ToolCallContext::new(self.conversation.metrics.clone()).sender(self.sender.clone());
 
         // Asynchronously generate a title for the provided task
-        // FIXME: Move into app.rs
+        // TODO: Move into app.rs
         let title = self.generate_title(model_id.clone());
 
         while !should_yield {
@@ -306,7 +302,7 @@ impl<S: AgentService> Orchestrator<S> {
             should_yield = is_complete
                 || tool_calls
                     .iter()
-                    .any(|call| Tools::should_yield(&call.name));
+                    .any(|call| ToolCatalog::should_yield(&call.name));
 
             if let Some(reasoning) = reasoning.as_ref()
                 && context.is_reasoning_supported()
@@ -335,13 +331,8 @@ impl<S: AgentService> Orchestrator<S> {
                         "attempts_left": attempts_left,
                         "allowed_max_attempts": allowed_max_attempts,
                     });
-                    let text = self
-                        .services
-                        .render(
-                            Template::new("{{> forge-tool-retry-message.md }}"),
-                            &context,
-                        )
-                        .await?;
+                    let text = TemplateEngine::default()
+                        .render("forge-tool-retry-message.md", &context)?;
                     let message = Element::new("retry").text(text);
 
                     result.output.combine_mut(ToolOutput::text(message));
@@ -389,12 +380,12 @@ impl<S: AgentService> Orchestrator<S> {
                     should_yield = true;
                 }
             }
-        }
 
-        // Update metrics in conversation
-        tool_context.with_metrics(|metrics| {
-            self.conversation.metrics = metrics.clone();
-        })?;
+            // Update metrics in conversation
+            tool_context.with_metrics(|metrics| {
+                self.conversation.metrics = metrics.clone();
+            })?;
+        }
 
         // Set conversation title
         if let Some(title) = title.await.ok().flatten() {
@@ -412,12 +403,8 @@ impl<S: AgentService> Orchestrator<S> {
         Ok(())
     }
 
-    fn get_model(&self) -> anyhow::Result<ModelId> {
-        Ok(self
-            .agent
-            .model
-            .clone()
-            .ok_or(Error::MissingModel(self.agent.id.clone()))?)
+    fn get_model(&self) -> ModelId {
+        self.agent.model.clone()
     }
 
     /// Creates a join handle which eventually resolves with the conversation
@@ -431,7 +418,7 @@ impl<S: AgentService> Orchestrator<S> {
                 self.services.clone(),
                 prompt.to_owned(),
                 model,
-                self.agent.provider,
+                Some(self.agent.provider.clone()),
             )
             .reasoning(self.agent.reasoning.clone());
 

@@ -5,12 +5,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use forge_app::dto::ToolsOverview;
 use forge_app::{
-    AgentRegistry, AppConfigService, AuthService, CommandInfra, CommandLoaderService,
-    ConversationService, EnvironmentInfra, EnvironmentService, FileDiscoveryService, ForgeApp,
-    McpConfigManager, McpService, ProviderAuthService, ProviderService, Services, User, UserUsage,
-    Walker, WorkflowService,
+    AgentProviderResolver, AgentRegistry, AppConfigService, AuthService, CommandInfra,
+    CommandLoaderService, ConversationService, EnvironmentInfra, EnvironmentService,
+    FileDiscoveryService, ForgeApp, GitApp, McpConfigManager, McpService, ProviderAuthService,
+    ProviderService, Services, User, UserUsage, Walker, WorkflowService,
 };
-use forge_domain::{InitAuth, LoginInfo, *};
+use forge_domain::{Agent, InitAuth, LoginInfo, *};
 use forge_infra::ForgeInfra;
 use forge_repo::ForgeRepo;
 use forge_services::ForgeServices;
@@ -38,17 +38,24 @@ impl<A, F> ForgeAPI<A, F> {
     }
 }
 
-impl ForgeAPI<ForgeServices<ForgeRepo<ForgeInfra>>, ForgeInfra> {
+impl ForgeAPI<ForgeServices<ForgeRepo<ForgeInfra>>, ForgeRepo<ForgeInfra>> {
     pub fn init(restricted: bool, cwd: PathBuf) -> Self {
         let infra = Arc::new(ForgeInfra::new(restricted, cwd));
         let repo = Arc::new(ForgeRepo::new(infra.clone()));
         let app = Arc::new(ForgeServices::new(repo.clone()));
-        ForgeAPI::new(app, infra)
+        ForgeAPI::new(app, repo)
+    }
+
+    pub async fn get_skills_internal(&self) -> Result<Vec<Skill>> {
+        use forge_domain::SkillRepository;
+        self.infra.load_skills().await
     }
 }
 
 #[async_trait::async_trait]
-impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
+impl<A: Services, F: CommandInfra + EnvironmentInfra + SkillRepository + AppConfigRepository> API
+    for ForgeAPI<A, F>
+{
     async fn discover(&self) -> Result<Vec<File>> {
         let environment = self.services.get_environment();
         let config = Walker::unlimited().cwd(environment.cwd);
@@ -70,11 +77,40 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
             .await?)
     }
     async fn get_agents(&self) -> Result<Vec<Agent>> {
-        Ok(self.services.get_agents().await?)
+        self.services.get_agents().await
     }
 
     async fn get_providers(&self) -> Result<Vec<AnyProvider>> {
         Ok(self.services.get_all_providers().await?)
+    }
+
+    async fn commit(
+        &self,
+        preview: bool,
+        max_diff_size: Option<usize>,
+        diff: Option<String>,
+        additional_context: Option<String>,
+    ) -> Result<forge_app::CommitResult> {
+        let git_app = GitApp::new(self.services.clone());
+        let result = git_app
+            .commit_message(max_diff_size, diff, additional_context)
+            .await?;
+
+        if preview {
+            Ok(result)
+        } else {
+            git_app
+                .commit(result.message, result.has_staged_files)
+                .await
+        }
+    }
+
+    async fn get_provider(&self, id: &ProviderId) -> Result<AnyProvider> {
+        let providers = self.services.get_all_providers().await?;
+        Ok(providers
+            .into_iter()
+            .find(|p| p.id() == *id)
+            .ok_or_else(|| Error::provider_not_available(id.clone()))?)
     }
 
     async fn chat(
@@ -97,7 +133,14 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
         &self,
         conversation_id: &ConversationId,
     ) -> anyhow::Result<CompactionResult> {
-        self.app().compact_conversation(conversation_id).await
+        let agent_id = self
+            .services
+            .get_active_agent_id()
+            .await?
+            .unwrap_or_default();
+        self.app()
+            .compact_conversation(agent_id, conversation_id)
+            .await
     }
 
     fn environment(&self) -> Environment {
@@ -184,16 +227,17 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
     async fn logout(&self) -> Result<()> {
         self.app().logout().await
     }
-    async fn get_agent_provider(&self, agent_id: AgentId) -> anyhow::Result<Provider<Url>> {
-        self.app().get_provider(Some(agent_id)).await
-    }
 
-    async fn get_default_provider(&self) -> anyhow::Result<Provider<Url>> {
-        self.app().get_provider(None).await
+    async fn get_agent_provider(&self, agent_id: AgentId) -> anyhow::Result<Provider<Url>> {
+        let agent_provider_resolver = AgentProviderResolver::new(self.services.clone());
+        agent_provider_resolver.get_provider(Some(agent_id)).await
     }
 
     async fn set_default_provider(&self, provider_id: ProviderId) -> anyhow::Result<()> {
-        self.services.set_default_provider(provider_id).await
+        let result = self.services.set_default_provider(provider_id).await;
+        // Invalidate cache for agents
+        let _ = self.services.reload_agents().await;
+        result
     }
 
     async fn user_info(&self) -> Result<Option<User>> {
@@ -230,18 +274,19 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
     }
 
     async fn get_agent_model(&self, agent_id: AgentId) -> Option<ModelId> {
-        self.app().get_model(Some(agent_id)).await.ok()
+        let agent_provider_resolver = AgentProviderResolver::new(self.services.clone());
+        agent_provider_resolver.get_model(Some(agent_id)).await.ok()
     }
 
     async fn get_default_model(&self) -> Option<ModelId> {
-        self.app().get_model(None).await.ok()
+        self.services.get_provider_model(None).await.ok()
     }
-    async fn set_default_model(
-        &self,
-        agent_id: Option<AgentId>,
-        model_id: ModelId,
-    ) -> anyhow::Result<()> {
-        self.app().set_default_model(agent_id, model_id).await
+    async fn set_default_model(&self, model_id: ModelId) -> anyhow::Result<()> {
+        let result = self.services.set_default_model(model_id).await;
+        // Invalidate cache for agents
+        let _ = self.services.reload_agents().await;
+
+        result
     }
 
     async fn get_login_info(&self) -> Result<Option<LoginInfo>> {
@@ -253,6 +298,16 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
     }
     async fn get_commands(&self) -> Result<Vec<Command>> {
         self.services.get_commands().await
+    }
+
+    async fn get_skills(&self) -> Result<Vec<Skill>> {
+        self.infra.load_skills().await
+    }
+
+    async fn generate_command(&self, prompt: UserPrompt) -> Result<String> {
+        use forge_app::CommandGenerator;
+        let generator = CommandGenerator::new(self.services.clone());
+        generator.generate(prompt).await
     }
 
     async fn init_provider_auth(
@@ -276,5 +331,17 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra> API for ForgeAPI<A, F> {
             .services
             .complete_provider_auth(provider_id, context, timeout)
             .await?)
+    }
+
+    async fn remove_provider(&self, provider_id: &ProviderId) -> Result<()> {
+        Ok(self.services.remove_credential(provider_id).await?)
+    }
+
+    async fn migrate_env_credentials(&self) -> Result<Option<forge_domain::MigrationResult>> {
+        Ok(self.services.migrate_env_credentials().await?)
+    }
+
+    async fn get_default_provider(&self) -> Result<Provider<Url>> {
+        self.services.get_default_provider().await
     }
 }

@@ -57,16 +57,35 @@ impl ClientBuilder {
 
             ProviderResponse::Anthropic => {
                 let url = provider.url.clone();
-                InnerClient::Anthropic(Box::new(Anthropic::new(
-                    http.clone(),
-                    provider
-                        .api_key()
-                        .map(|x| x.as_str().to_string())
-                        .unwrap_or_default(),
-                    url,
-                    provider.models,
-                    "2023-06-01".to_string(),
-                )))
+                let creds = provider
+                    .credential
+                    .context("Anthropic provider requires credentials")?
+                    .auth_details;
+                match creds {
+                    forge_domain::AuthDetails::ApiKey(api_key) => {
+                        InnerClient::Anthropic(Box::new(Anthropic::new(
+                            http.clone(),
+                            api_key.as_str().to_string(),
+                            url,
+                            provider.models,
+                            "2023-06-01".to_string(),
+                            false,
+                        )))
+                    }
+                    forge_domain::AuthDetails::OAuth { tokens, .. } => {
+                        InnerClient::Anthropic(Box::new(Anthropic::new(
+                            http.clone(),
+                            tokens.access_token.as_str().to_string(),
+                            url,
+                            provider.models,
+                            "2023-06-01".to_string(),
+                            true,
+                        )))
+                    }
+                    _ => {
+                        anyhow::bail!("Unsupported authentication method for Anthropic provider",);
+                    }
+                }
             }
         };
 
@@ -235,7 +254,7 @@ mod tests {
 
     fn make_test_credential() -> Option<forge_domain::AuthCredential> {
         Some(forge_domain::AuthCredential {
-            id: ProviderId::OpenAI,
+            id: ProviderId::OPENAI,
             auth_details: forge_domain::AuthDetails::ApiKey(forge_domain::ApiKey::from(
                 "test-key".to_string(),
             )),
@@ -246,12 +265,12 @@ mod tests {
     #[tokio::test]
     async fn test_cache_initialization() {
         let provider = forge_domain::Provider {
-            id: ProviderId::OpenAI,
+            id: ProviderId::OPENAI,
             response: ProviderResponse::OpenAI,
             url: Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
-            credential: make_test_credential(),
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             url_params: vec![],
+            credential: make_test_credential(),
             models: forge_domain::Models::Url(
                 Url::parse("https://api.openai.com/v1/models").unwrap(),
             ),
@@ -268,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_models_method_exists() {
         let provider = forge_domain::Provider {
-            id: ProviderId::OpenAI,
+            id: ProviderId::OPENAI,
             response: ProviderResponse::OpenAI,
             url: Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
             credential: make_test_credential(),
@@ -292,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn test_builder_pattern_api() {
         let provider = forge_domain::Provider {
-            id: ProviderId::OpenAI,
+            id: ProviderId::OPENAI,
             response: ProviderResponse::OpenAI,
             url: Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
             credential: make_test_credential(),
@@ -319,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_builder_with_defaults() {
         let provider = forge_domain::Provider {
-            id: ProviderId::OpenAI,
+            id: ProviderId::OPENAI,
             response: ProviderResponse::OpenAI,
             url: Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
             credential: make_test_credential(),

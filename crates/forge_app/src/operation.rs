@@ -5,8 +5,8 @@ use console::strip_ansi_codes;
 use derive_setters::Setters;
 use forge_display::DiffFormat;
 use forge_domain::{
-    Environment, FSPatch, FSRead, FSRemove, FSSearch, FSUndo, FSWrite, Metrics, NetFetch,
-    PlanCreate, ToolName,
+    Environment, FSPatch, FSRead, FSRemove, FSSearch, FSUndo, FSWrite, FileOperation, Metrics,
+    NetFetch, PlanCreate, ToolKind,
 };
 use forge_template::Element;
 
@@ -14,46 +14,11 @@ use crate::truncation::{
     Stderr, Stdout, TruncationMode, truncate_fetch_content, truncate_search_output,
     truncate_shell_output,
 };
-use crate::utils::format_display_path;
+use crate::utils::{compute_hash, format_display_path};
 use crate::{
     FsCreateOutput, FsRemoveOutput, FsUndoOutput, HttpResponse, PatchOutput, PlanCreateOutput,
     ReadOutput, ResponseContext, SearchResult, ShellOutput,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OperationType {
-    Change,
-    Undo,
-}
-
-struct FileOperationStats {
-    path: String,
-    tool_name: ToolName,
-    lines_added: u64,
-    lines_removed: u64,
-    operation_type: OperationType,
-}
-
-fn file_change_stats(operation: FileOperationStats, metrics: &mut Metrics) {
-    tracing::info!(path = %operation.path, type = %operation.tool_name, lines_added = %operation.lines_added, lines_removed = %operation.lines_removed, "File change stats");
-
-    match operation.operation_type {
-        OperationType::Undo => {
-            metrics.record_file_undo(
-                operation.path,
-                operation.lines_added,
-                operation.lines_removed,
-            );
-        }
-        OperationType::Change => {
-            metrics.record_file_operation(
-                operation.path,
-                operation.lines_added,
-                operation.lines_removed,
-            );
-        }
-    }
-}
 
 #[derive(Debug, Default, Setters)]
 #[setters(into, strip_option)]
@@ -104,6 +69,11 @@ pub enum ToolOperation {
     PlanCreate {
         input: PlanCreate,
         output: PlanCreateOutput,
+    },
+    Skill {
+        #[allow(dead_code)]
+        input: forge_domain::SkillFetch,
+        output: forge_domain::Skill,
     },
 }
 
@@ -218,22 +188,30 @@ fn create_stream_element<T: StreamElement>(
 impl ToolOperation {
     pub fn into_tool_output(
         self,
-        tool_name: ToolName,
+        tool_kind: ToolKind,
         content_files: TempContentFiles,
         env: &Environment,
         metrics: &mut Metrics,
     ) -> forge_domain::ToolOutput {
+        let tool_name = tool_kind.name();
         match self {
             ToolOperation::FsRead { input, output } => {
                 let content = output.content.file_content();
                 let elm = Element::new("file_content")
-                    .attr("path", input.path)
+                    .attr("path", &input.path)
                     .attr(
                         "display_lines",
                         format!("{}-{}", output.start_line, output.end_line),
                     )
                     .attr("total_lines", content.lines().count())
                     .cdata(content);
+
+                // Track read operations
+                tracing::info!(path = %input.path, tool = %tool_name, "File read");
+                *metrics = metrics.clone().insert(
+                    input.path.clone(),
+                    FileOperation::new(tool_kind).content_hash(Some(output.content_hash.clone())),
+                );
 
                 forge_domain::ToolOutput::text(elm)
             }
@@ -245,15 +223,12 @@ impl ToolOperation {
                 );
                 let diff = console::strip_ansi_codes(diff_result.diff()).to_string();
 
-                file_change_stats(
-                    FileOperationStats {
-                        path: input.path.clone(),
-                        tool_name: tool_name.clone(),
-                        lines_added: diff_result.lines_added(),
-                        lines_removed: diff_result.lines_removed(),
-                        operation_type: OperationType::Change,
-                    },
-                    metrics,
+                *metrics = metrics.clone().insert(
+                    input.path.clone(),
+                    FileOperation::new(tool_kind)
+                        .lines_added(diff_result.lines_added())
+                        .lines_removed(diff_result.lines_removed())
+                        .content_hash(Some(output.content_hash.clone())),
                 );
 
                 let mut elm = if output.before.as_ref().is_some() {
@@ -273,15 +248,14 @@ impl ToolOperation {
                 forge_domain::ToolOutput::text(elm)
             }
             ToolOperation::FsRemove { input, output } => {
-                file_change_stats(
-                    FileOperationStats {
-                        path: input.path.clone(),
-                        tool_name: tool_name.clone(),
-                        lines_added: 0,
-                        lines_removed: output.content.lines().count() as u64,
-                        operation_type: OperationType::Change,
-                    },
-                    metrics,
+                // None since file was removed
+                let content_hash = None;
+
+                *metrics = metrics.clone().insert(
+                    input.path.clone(),
+                    FileOperation::new(tool_kind)
+                        .lines_removed(output.content.lines().count() as u64)
+                        .content_hash(content_hash),
                 );
 
                 let display_path = format_display_path(Path::new(&input.path), env.cwd.as_path());
@@ -356,6 +330,7 @@ impl ToolOperation {
             ToolOperation::FsPatch { input, output } => {
                 let diff_result = DiffFormat::format(&output.before, &output.after);
                 let diff = console::strip_ansi_codes(diff_result.diff()).to_string();
+
                 let mut elm = Element::new("file_diff")
                     .attr("path", &input.path)
                     .attr("total_lines", output.after.lines().count())
@@ -365,15 +340,12 @@ impl ToolOperation {
                     elm = elm.append(Element::new("warning").text(warning));
                 }
 
-                file_change_stats(
-                    FileOperationStats {
-                        path: input.path.clone(),
-                        tool_name: tool_name.clone(),
-                        lines_added: diff_result.lines_added(),
-                        lines_removed: diff_result.lines_removed(),
-                        operation_type: OperationType::Change,
-                    },
-                    metrics,
+                *metrics = metrics.clone().insert(
+                    input.path.clone(),
+                    FileOperation::new(tool_kind)
+                        .lines_added(diff_result.lines_added())
+                        .lines_removed(diff_result.lines_removed())
+                        .content_hash(Some(output.content_hash.clone())),
                 );
 
                 forge_domain::ToolOutput::text(elm)
@@ -385,17 +357,16 @@ impl ToolOperation {
                     output.after_undo.as_deref().unwrap_or(""),
                     output.before_undo.as_deref().unwrap_or(""),
                 );
+                let content_hash = output.after_undo.as_ref().map(|s| compute_hash(s));
 
-                file_change_stats(
-                    FileOperationStats {
-                        path: input.path.clone(),
-                        tool_name: tool_name.clone(),
-                        lines_added: diff.lines_added(),
-                        lines_removed: diff.lines_removed(),
-                        operation_type: OperationType::Undo,
-                    },
-                    metrics,
+                *metrics = metrics.clone().insert(
+                    input.path.clone(),
+                    FileOperation::new(tool_kind)
+                        .lines_added(diff.lines_added())
+                        .lines_removed(diff.lines_removed())
+                        .content_hash(content_hash),
                 );
+
                 match (&output.before_undo, &output.after_undo) {
                     (None, None) => {
                         let elm = Element::new("file_undo")
@@ -512,6 +483,27 @@ impl ToolOperation {
 
                 forge_domain::ToolOutput::text(elm)
             }
+            ToolOperation::Skill { input: _, output } => {
+                let mut elm = Element::new("skill_details");
+
+                elm = elm.append({
+                    let mut elm = Element::new("command");
+                    if let Some(path) = output.path {
+                        elm = elm.attr("location", path.display().to_string());
+                    }
+
+                    elm.cdata(output.command)
+                });
+
+                // Insert Resources
+                if !output.resources.is_empty() {
+                    elm = elm.append(output.resources.iter().map(|resource| {
+                        Element::new("resource").text(resource.display().to_string())
+                    }));
+                }
+
+                forge_domain::ToolOutput::text(elm)
+            }
         }
     }
 }
@@ -560,6 +552,8 @@ mod tests {
 
     #[test]
     fn test_fs_read_basic() {
+        let content = "Hello, world!\nThis is a test file.";
+        let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
                 path: "/home/user/test.txt".to_string(),
@@ -568,20 +562,21 @@ mod tests {
                 show_line_numbers: true,
             },
             output: ReadOutput {
-                content: Content::File("Hello, world!\nThis is a test file.".to_string()),
+                content: Content::file(content),
                 start_line: 1,
                 end_line: 2,
                 total_lines: 2,
+                content_hash: hash,
             },
         };
 
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("read"),
+            ToolKind::Read,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -589,6 +584,8 @@ mod tests {
 
     #[test]
     fn test_fs_read_basic_special_chars() {
+        let content = "struct Foo<T>{ name: T }";
+        let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
                 path: "/home/user/test.txt".to_string(),
@@ -597,20 +594,20 @@ mod tests {
                 show_line_numbers: true,
             },
             output: ReadOutput {
-                content: Content::File("struct Foo<T>{ name: T }".to_string()),
+                content: Content::file(content),
                 start_line: 1,
                 end_line: 1,
                 total_lines: 1,
+                content_hash: hash,
             },
         };
 
         let env = fixture_environment();
-
         let actual = fixture.into_tool_output(
-            ToolName::new("read"),
+            ToolKind::Read,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -618,6 +615,8 @@ mod tests {
 
     #[test]
     fn test_fs_read_with_explicit_range() {
+        let content = "Line 1\nLine 2\nLine 3";
+        let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
                 path: "/home/user/test.txt".to_string(),
@@ -626,20 +625,21 @@ mod tests {
                 show_line_numbers: true,
             },
             output: ReadOutput {
-                content: Content::File("Line 1\nLine 2\nLine 3".to_string()),
+                content: Content::file(content),
                 start_line: 2,
                 end_line: 3,
                 total_lines: 5,
+                content_hash: hash,
             },
         };
 
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("read"),
+            ToolKind::Read,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -647,6 +647,8 @@ mod tests {
 
     #[test]
     fn test_fs_read_with_truncation_path() {
+        let content = "Truncated content";
+        let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
                 path: "/home/user/large_file.txt".to_string(),
@@ -655,10 +657,11 @@ mod tests {
                 show_line_numbers: true,
             },
             output: ReadOutput {
-                content: Content::File("Truncated content".to_string()),
+                content: Content::file(content),
                 start_line: 1,
                 end_line: 100,
                 total_lines: 200,
+                content_hash: hash,
             },
         };
 
@@ -667,10 +670,10 @@ mod tests {
             TempContentFiles::default().stdout(PathBuf::from("/tmp/truncated_content.txt"));
 
         let actual = fixture.into_tool_output(
-            ToolName::new("read"),
+            ToolKind::Read,
             truncation_path,
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -678,26 +681,28 @@ mod tests {
 
     #[test]
     fn test_fs_create_basic() {
+        let content = "Hello, world!";
         let fixture = ToolOperation::FsCreate {
             input: forge_domain::FSWrite {
                 path: "/home/user/new_file.txt".to_string(),
-                content: "Hello, world!".to_string(),
+                content: content.to_string(),
                 overwrite: false,
             },
             output: FsCreateOutput {
                 path: "/home/user/new_file.txt".to_string(),
                 before: None,
                 warning: None,
+                content_hash: compute_hash(content),
             },
         };
 
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("write"),
+            ToolKind::Write,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -705,25 +710,27 @@ mod tests {
 
     #[test]
     fn test_fs_create_overwrite() {
+        let content = "New content for the file";
         let fixture = ToolOperation::FsCreate {
             input: forge_domain::FSWrite {
                 path: "/home/user/existing_file.txt".to_string(),
-                content: "New content for the file".to_string(),
+                content: content.to_string(),
                 overwrite: true,
             },
             output: FsCreateOutput {
                 path: "/home/user/existing_file.txt".to_string(),
                 before: Some("Old content".to_string()),
                 warning: None,
+                content_hash: compute_hash(content),
             },
         };
 
         let env = fixture_environment();
         let actual = fixture.into_tool_output(
-            ToolName::new("write"),
+            ToolKind::Write,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -745,10 +752,10 @@ mod tests {
 
         let env = fixture_environment();
         let actual = fixture.into_tool_output(
-            ToolName::new("write"),
+            ToolKind::Write,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -779,10 +786,10 @@ mod tests {
         let truncation_path =
             TempContentFiles::default().stdout(PathBuf::from("/tmp/stdout_content.txt"));
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             truncation_path,
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -813,10 +820,10 @@ mod tests {
         let truncation_path =
             TempContentFiles::default().stderr(PathBuf::from("/tmp/stderr_content.txt"));
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             truncation_path,
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -854,10 +861,10 @@ mod tests {
             .stdout(PathBuf::from("/tmp/stdout_content.txt"))
             .stderr(PathBuf::from("/tmp/stderr_content.txt"));
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             truncation_path,
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -886,10 +893,10 @@ mod tests {
 
         let env = fixture_environment();
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -911,10 +918,10 @@ mod tests {
 
         let env = fixture_environment();
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -936,10 +943,10 @@ mod tests {
 
         let env = fixture_environment();
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -977,10 +984,10 @@ mod tests {
             .stdout(PathBuf::from("/tmp/stdout_content.txt"))
             .stderr(PathBuf::from("/tmp/stderr_content.txt"));
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             truncation_path,
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1015,10 +1022,10 @@ mod tests {
         let env = fixture_environment(); // max_search_lines is 25
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1055,10 +1062,10 @@ mod tests {
         env.max_search_lines = 10;
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1097,10 +1104,10 @@ mod tests {
         env.max_search_result_bytes = max_bytes.ceil() as usize; // limit to 0.001 MB
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1142,10 +1149,10 @@ mod tests {
         env.max_search_result_bytes = max_bytes.ceil() as usize; // limit to 0.001 MB
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1167,10 +1174,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1178,26 +1185,28 @@ mod tests {
 
     #[test]
     fn test_fs_create_with_warning() {
+        let content = "Content with warning";
         let fixture = ToolOperation::FsCreate {
             input: forge_domain::FSWrite {
                 path: "/home/user/file_with_warning.txt".to_string(),
-                content: "Content with warning".to_string(),
+                content: content.to_string(),
                 overwrite: false,
             },
             output: FsCreateOutput {
                 path: "/home/user/file_with_warning.txt".to_string(),
                 before: None,
                 warning: Some("File created in non-standard location".to_string()),
+                content_hash: compute_hash(content),
             },
         };
 
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("write"),
+            ToolKind::Write,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1213,10 +1222,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("remove"),
+            ToolKind::Remove,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1255,10 +1264,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1280,10 +1289,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("search"),
+            ToolKind::Search,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1291,6 +1300,7 @@ mod tests {
 
     #[test]
     fn test_fs_patch_basic() {
+        let after_content = "Hello universe\nThis is a test";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
                 path: "/home/user/test.txt".to_string(),
@@ -1301,17 +1311,18 @@ mod tests {
             output: PatchOutput {
                 warning: None,
                 before: "Hello world\nThis is a test".to_string(),
-                after: "Hello universe\nThis is a test".to_string(),
+                after: after_content.to_string(),
+                content_hash: compute_hash(after_content),
             },
         };
 
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("patch"),
+            ToolKind::Patch,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1319,6 +1330,7 @@ mod tests {
 
     #[test]
     fn test_fs_patch_with_warning() {
+        let after_content = "line1\nnew line\nline2";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
                 path: "/home/user/large_file.txt".to_string(),
@@ -1329,17 +1341,18 @@ mod tests {
             output: PatchOutput {
                 warning: Some("Large file modification".to_string()),
                 before: "line1\nline2".to_string(),
-                after: "line1\nnew line\nline2".to_string(),
+                after: after_content.to_string(),
+                content_hash: compute_hash(after_content),
             },
         };
 
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("patch"),
+            ToolKind::Patch,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1355,10 +1368,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("undo"),
+            ToolKind::Undo,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1377,10 +1390,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("undo"),
+            ToolKind::Undo,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1401,10 +1414,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("undo"),
+            ToolKind::Undo,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1423,10 +1436,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("undo"),
+            ToolKind::Undo,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1445,10 +1458,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("undo"),
+            ToolKind::Undo,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1472,10 +1485,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("fetch"),
+            ToolKind::Fetch,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1507,10 +1520,10 @@ mod tests {
             TempContentFiles::default().stdout(PathBuf::from("/tmp/forge_fetch_abc123.txt"));
 
         let actual = fixture.into_tool_output(
-            ToolName::new("fetch"),
+            ToolKind::Fetch,
             truncation_path,
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         // make sure that the content is truncated
@@ -1543,10 +1556,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("shell"),
+            ToolKind::Shell,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1561,10 +1574,10 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("followup"),
+            ToolKind::Followup,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));
@@ -1577,10 +1590,38 @@ mod tests {
         let env = fixture_environment();
 
         let actual = fixture.into_tool_output(
-            ToolName::new("followup"),
+            ToolKind::Followup,
             TempContentFiles::default(),
             &env,
-            &mut Metrics::new(),
+            &mut Metrics::default(),
+        );
+
+        insta::assert_snapshot!(to_value(actual));
+    }
+
+    #[test]
+    fn test_skill_operation() {
+        let fixture = ToolOperation::Skill {
+            input: forge_domain::SkillFetch { name: "test-skill".to_string() },
+            output: forge_domain::Skill::new(
+                "test-skill",
+                "This is a test skill command with instructions",
+                "A test skill for demonstration",
+            )
+            .path("/home/user/.forge/skills/test-skill")
+            .resources(vec![
+                PathBuf::from("/home/user/.forge/skills/test-skill/resource1.txt"),
+                PathBuf::from("/home/user/.forge/skills/test-skill/resource2.md"),
+            ]),
+        };
+
+        let env = fixture_environment();
+
+        let actual = fixture.into_tool_output(
+            ToolKind::Skill,
+            TempContentFiles::default(),
+            &env,
+            &mut Metrics::default(),
         );
 
         insta::assert_snapshot!(to_value(actual));

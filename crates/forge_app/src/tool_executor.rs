@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use forge_domain::{LineNumbers, TitleFormat, ToolCallContext, ToolCallFull, ToolOutput, Tools};
+use forge_domain::{
+    LineNumbers, TitleFormat, ToolCallContext, ToolCallFull, ToolCatalog, ToolOutput,
+};
 
 use crate::fmt::content::FormatContent;
 use crate::operation::{TempContentFiles, ToolOperation};
@@ -10,7 +12,7 @@ use crate::utils::format_display_path;
 use crate::{
     ConversationService, EnvironmentService, FollowUpService, FsCreateService, FsPatchService,
     FsReadService, FsRemoveService, FsSearchService, FsUndoService, ImageReadService,
-    NetFetchService, PlanCreateService, PolicyService,
+    NetFetchService, PlanCreateService, PolicyService, SkillFetchService,
 };
 
 pub struct ToolExecutor<S> {
@@ -31,7 +33,8 @@ impl<
         + ConversationService
         + EnvironmentService
         + PlanCreateService
-        + PolicyService,
+        + PolicyService
+        + SkillFetchService,
 > ToolExecutor<S>
 {
     pub fn new(services: Arc<S>) -> Self {
@@ -42,7 +45,7 @@ impl<
     #[allow(unused)]
     async fn check_tool_permission(
         &self,
-        tool_input: &Tools,
+        tool_input: &ToolCatalog,
         context: &ToolCallContext,
     ) -> anyhow::Result<bool> {
         let cwd = self.services.get_environment().cwd;
@@ -149,9 +152,9 @@ impl<
         Ok(path)
     }
 
-    async fn call_internal(&self, input: Tools) -> anyhow::Result<ToolOperation> {
+    async fn call_internal(&self, input: ToolCatalog) -> anyhow::Result<ToolOperation> {
         Ok(match input {
-            Tools::Read(input) => {
+            ToolCatalog::Read(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self
                     .services
@@ -171,12 +174,12 @@ impl<
 
                 (input, output).into()
             }
-            Tools::ReadImage(input) => {
+            ToolCatalog::ReadImage(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self.services.read_image(normalized_path).await?;
                 output.into()
             }
-            Tools::Write(input) => {
+            ToolCatalog::Write(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self
                     .services
@@ -184,7 +187,7 @@ impl<
                     .await?;
                 (input, output).into()
             }
-            Tools::Search(input) => {
+            ToolCatalog::Search(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self
                     .services
@@ -196,12 +199,12 @@ impl<
                     .await?;
                 (input, output).into()
             }
-            Tools::Remove(input) => {
+            ToolCatalog::Remove(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self.services.remove(normalized_path).await?;
                 (input, output).into()
             }
-            Tools::Patch(input) => {
+            ToolCatalog::Patch(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self
                     .services
@@ -214,12 +217,12 @@ impl<
                     .await?;
                 (input, output).into()
             }
-            Tools::Undo(input) => {
+            ToolCatalog::Undo(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self.services.undo(normalized_path).await?;
                 (input, output).into()
             }
-            Tools::Shell(input) => {
+            ToolCatalog::Shell(input) => {
                 let normalized_cwd = self.normalize_path(input.cwd.display().to_string());
                 let output = self
                     .services
@@ -227,16 +230,17 @@ impl<
                         input.command.clone(),
                         PathBuf::from(normalized_cwd),
                         input.keep_ansi,
+                        false,
                         input.env.clone(),
                     )
                     .await?;
                 output.into()
             }
-            Tools::Fetch(input) => {
+            ToolCatalog::Fetch(input) => {
                 let output = self.services.fetch(input.url.clone(), input.raw).await?;
                 (input, output).into()
             }
-            Tools::Followup(input) => {
+            ToolCatalog::Followup(input) => {
                 let output = self
                     .services
                     .follow_up(
@@ -255,7 +259,7 @@ impl<
                     .await?;
                 output.into()
             }
-            Tools::Plan(input) => {
+            ToolCatalog::Plan(input) => {
                 let output = self
                     .services
                     .create_plan(
@@ -266,6 +270,10 @@ impl<
                     .await?;
                 (input, output).into()
             }
+            ToolCatalog::Skill(input) => {
+                let skill = self.services.fetch_skill(input.name.clone()).await?;
+                (input, skill).into()
+            }
         })
     }
 
@@ -274,8 +282,8 @@ impl<
         input: ToolCallFull,
         context: &ToolCallContext,
     ) -> anyhow::Result<ToolOutput> {
-        let tool_name = input.name.clone();
-        let tool_input: Tools = Tools::try_from(input)?;
+        let tool_input: ToolCatalog = ToolCatalog::try_from(input)?;
+        let tool_kind = tool_input.kind();
         let env = self.services.get_environment();
         if let Some(content) = tool_input.to_content(&env) {
             context.send(content).await?;
@@ -311,7 +319,7 @@ impl<
         let truncation_path = self.dump_operation(&operation).await?;
 
         context.with_metrics(|metrics| {
-            operation.into_tool_output(tool_name, truncation_path, &env, metrics)
+            operation.into_tool_output(tool_kind, truncation_path, &env, metrics)
         })
     }
 }

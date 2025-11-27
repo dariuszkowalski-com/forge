@@ -7,10 +7,18 @@
 # Using typeset to keep variables local to plugin scope and prevent public exposure
 typeset -h _FORGE_BIN="${FORGE_BIN:-forge}"
 typeset -h _FORGE_CONVERSATION_PATTERN=":"
+typeset -h _FORGE_MAX_COMMIT_DIFF="${FORGE_MAX_COMMIT_DIFF:-100000}"
 typeset -h _FORGE_DELIMITER='\s\s+'
 
 # Detect fd command - Ubuntu/Debian use 'fdfind', others use 'fd'
 typeset -h _FORGE_FD_CMD="$(command -v fdfind 2>/dev/null || command -v fd 2>/dev/null || echo 'fd')"
+
+# Detect bat command - use bat if available, otherwise fall back to cat
+if command -v bat &>/dev/null; then
+    typeset -h _FORGE_CAT_CMD="bat --color=always --style=numbers,changes --line-range=:500"
+else
+    typeset -h _FORGE_CAT_CMD="cat"
+fi
 
 # Commands cache - loaded lazily on first use
 typeset -h _FORGE_COMMANDS=""
@@ -22,24 +30,25 @@ typeset -h _FORGE_ACTIVE_AGENT="forge"
 # Store conversation ID in a temporary variable (local to plugin)
 typeset -h _FORGE_CONVERSATION_ID=""
 
-# Style tagged files
-ZSH_HIGHLIGHT_PATTERNS+=('@\[[^]]#\]' 'fg=cyan,bold')
-
-ZSH_HIGHLIGHT_HIGHLIGHTERS+=(pattern)
 # Style the conversation pattern with appropriate highlighting
 # Keywords in yellow, rest in default white
 
-# Highlight colon + word at the beginning in yellow
-ZSH_HIGHLIGHT_PATTERNS+=('(#s):[a-zA-Z]#' 'fg=yellow,bold')
+# Style tagged files
+ZSH_HIGHLIGHT_PATTERNS+=('@\[[^]]#\]' 'fg=cyan,bold')
 
-# Highlight everything after that word + space in white
-ZSH_HIGHLIGHT_PATTERNS+=('(#s):[a-zA-Z]# *(*|[[:graph:]]*)' 'fg=white,bold')
+# Highlight colon + command name (supports letters, numbers, hyphens, underscores) in yellow
+ZSH_HIGHLIGHT_PATTERNS+=('(#s):[a-zA-Z0-9_-]#' 'fg=yellow,bold')
+
+# Highlight everything after the command name + space in white
+ZSH_HIGHLIGHT_PATTERNS+=('(#s):[a-zA-Z0-9_-]# [[:graph:]]*' 'fg=white')
+
+ZSH_HIGHLIGHT_HIGHLIGHTERS+=(pattern)
 
 # Lazy loader for commands cache
 # Loads the commands list only when first needed, avoiding startup cost
 function _forge_get_commands() {
     if [[ -z "$_FORGE_COMMANDS" ]]; then
-        _FORGE_COMMANDS="$($_FORGE_BIN list commands --porcelain 2>/dev/null)"
+        _FORGE_COMMANDS="$(CLICOLOR_FORCE=0 $_FORGE_BIN list commands --porcelain 2>/dev/null)"
     fi
     echo "$_FORGE_COMMANDS"
 }
@@ -60,28 +69,70 @@ function _forge_exec() {
 
 # Helper function to clear buffer and reset prompt
 function _forge_reset() {
-    BUFFER=""
-    CURSOR=${#BUFFER}
-    zle reset-prompt
+    # Invoke precmd hooks to ensure prompt customizations (starship, oh-my-zsh themes, etc.) refresh properly
+    for precmd in $precmd_functions; do
+        if typeset -f "$precmd" >/dev/null 2>&1; then
+            "$precmd"
+        fi
+    done
+
+   BUFFER=""
+   CURSOR=0
+
+   zle reset-prompt 
+    
 }
 
-# Helper function to print operating agent messages with consistent formatting
-function _forge_print_agent_message() {
-    # Ensure FORGE_ACTIVE_AGENT always has a value, default to "forge"
-    local agent_name="${_FORGE_ACTIVE_AGENT:-forge}"
-    echo "\033[33m⏺\033[0m \033[90m[$(date '+%H:%M:%S')] \033[1;37m${agent_name:u}\033[0m \033[90mis the active agent\033[0m"
+# Helper function to print messages with consistent formatting based on log level
+# Usage: _forge_log <level> <message>
+# Levels: error, info, success, warning, debug
+# Color scheme matches crates/forge_main/src/title_display.rs
+function _forge_log() {
+    local level="$1"
+    local message="$2"
+    local timestamp="\033[90m[$(date '+%H:%M:%S')]\033[0m"
+    
+    case "$level" in
+        error)
+            # Category::Error - Red ❌
+            echo "\033[31m❌\033[0m ${timestamp} \033[31m${message}\033[0m"
+            ;;
+        info)
+            # Category::Info - White ⏺
+            echo "\033[37m⏺\033[0m ${timestamp} \033[37m${message}\033[0m"
+            ;;
+        success)
+            # Category::Action/Completion - Yellow ⏺
+            echo "\033[33m⏺\033[0m ${timestamp} \033[37m${message}\033[0m"
+            ;;
+        warning)
+            # Category::Warning - Bright yellow ⚠️
+            echo "\033[93m⚠️\033[0m ${timestamp} \033[93m${message}\033[0m"
+            ;;
+        debug)
+            # Category::Debug - Cyan ⏺ with dimmed text
+            echo "\033[36m⏺\033[0m ${timestamp} \033[90m${message}\033[0m"
+            ;;
+        *)
+            echo "${message}"
+            ;;
+    esac
 }
 
 # Helper function to find the index of a value in a list (1-based)
 # Returns the index if found, 1 otherwise
+# Usage: _forge_find_index <output> <value_to_find> [field_number]
+# field_number: which field to compare (1 for first field, 2 for second field, etc.)
 function _forge_find_index() {
     local output="$1"
     local value_to_find="$2"
+    local field_number="${3:-1}"  # Default to first field if not specified
 
     local index=1
     while IFS= read -r line; do
-        local name="${line%% *}"
-        if [[ "$name" == "$value_to_find" ]]; then
+        # Extract the specified field for comparison
+        local field_value=$(echo "$line" | awk "{print \$$field_number}")
+        if [[ "$field_value" == "$value_to_find" ]]; then
             echo "$index"
             return 0
         fi
@@ -90,6 +141,58 @@ function _forge_find_index() {
 
     echo "1"
     return 0
+}
+
+# Helper function to select a provider from the list
+# Usage: _forge_select_provider [filter_status] [current_provider]
+# Returns: selected provider line (via stdout)
+function _forge_select_provider() {
+    local filter_status="${1:-}"
+    local current_provider="${2:-}"
+    local output
+    output=$($_FORGE_BIN list provider --porcelain 2>/dev/null)
+    
+    if [[ -z "$output" ]]; then
+        _forge_log error "No providers available"
+        return 1
+    fi
+    
+    # Filter by status if specified (e.g., "available" for configured providers)
+    if [[ -n "$filter_status" ]]; then
+        output=$(echo "$output" | grep -i "$filter_status")
+        if [[ -z "$output" ]]; then
+            _forge_log error "No ${filter_status} providers found"
+            return 1
+        fi
+    fi
+    
+    # Get current provider if not provided
+    if [[ -z "$current_provider" ]]; then
+        current_provider=$($_FORGE_BIN config get provider --porcelain 2>/dev/null)
+    fi
+    
+    local fzf_args=(
+        --delimiter="$_FORGE_DELIMITER"
+        --prompt="Provider ❯ "
+        --with-nth=1,3..
+    )
+    
+    # Position cursor on current provider if available
+    if [[ -n "$current_provider" ]]; then
+        # For providers, compare against the first field (display name)
+        local index=$(_forge_find_index "$output" "$current_provider" 1)
+        fzf_args+=(--bind="start:pos($index)")
+    fi
+    
+    local selected
+    selected=$(echo "$output" | _forge_fzf "${fzf_args[@]}")
+    
+    if [[ -n "$selected" ]]; then
+        echo "$selected"
+        return 0
+    fi
+    
+    return 1
 }
 
 # Helper function to select and set config values with fzf
@@ -120,7 +223,8 @@ function _forge_select_and_set_config() {
             fi
 
             if [[ -n "$default_value" ]]; then
-                local index=$(_forge_find_index "$output" "$default_value")
+                # For models, compare against the first field (model_id)
+                local index=$(_forge_find_index "$output" "$default_value" 1)
                 
                 fzf_args+=(--bind="start:pos($index)")
                 
@@ -145,7 +249,7 @@ function _forge_handle_conversation_command() {
     
     # Check if FORGE_CONVERSATION_ID is set
     if [[ -z "$_FORGE_CONVERSATION_ID" ]]; then
-        echo "\033[31m✗\033[0m No active conversation. Start a conversation first or use :list to see existing ones"
+        _forge_log error "No active conversation. Start a conversation first or use :list to see existing ones"
         _forge_reset
         return 0
     fi
@@ -161,19 +265,19 @@ function _forge_handle_conversation_command() {
 function forge-completion() {
     local current_word="${LBUFFER##* }"
     
-    # Handle @ completion (existing functionality)
+    # Handle @ completion (files and directories)
     if [[ "$current_word" =~ ^@.*$ ]]; then
         local filter_text="${current_word#@}"
         local selected
         local fzf_args=(
-            --preview="bat --color=always --style=numbers,changes --line-range=:500 {} 2>/dev/null || cat {}"
+            --preview="if [ -d {} ]; then ls -la --color=always {} 2>/dev/null || ls -la {}; else $_FORGE_CAT_CMD {}; fi"
             --preview-window=right:60%:wrap:border-sharp
         )
         
         if [[ -n "$filter_text" ]]; then
-            selected=$($_FORGE_FD_CMD --type f --hidden --exclude .git | _forge_fzf --query "$filter_text" "${fzf_args[@]}")
+            selected=$($_FORGE_FD_CMD --type f --type d --hidden --exclude .git | _forge_fzf --query "$filter_text" "${fzf_args[@]}")
         else
-            selected=$($_FORGE_FD_CMD --type f --hidden --exclude .git | _forge_fzf "${fzf_args[@]}")
+            selected=$($_FORGE_FD_CMD --type f --type d --hidden --exclude .git | _forge_fzf "${fzf_args[@]}")
         fi
         
         if [[ -n "$selected" ]]; then
@@ -187,8 +291,8 @@ function forge-completion() {
         return 0
     fi
     
-    # Handle :command completion
-    if [[ "${LBUFFER}" =~ "^:[a-zA-Z]*$" ]]; then
+    # Handle :command completion (supports letters, numbers, hyphens, underscores)
+    if [[ "${LBUFFER}" =~ "^:([a-zA-Z][a-zA-Z0-9_-]*)?$" ]]; then
         # Extract the text after the colon for filtering
         local filter_text="${LBUFFER#:}"
         
@@ -227,7 +331,6 @@ function _forge_action_new() {
     
     echo
     _forge_exec banner
-    _forge_print_agent_message
     _forge_reset
 }
 
@@ -253,7 +356,7 @@ function _forge_action_env() {
 function _forge_action_dump() {
     local input_text="$1"
     if [[ "$input_text" == "html" ]]; then
-        _forge_handle_conversation_command "dump" "html"
+        _forge_handle_conversation_command "dump" "--html"
     else
         _forge_handle_conversation_command "dump"
     fi
@@ -271,7 +374,30 @@ function _forge_action_retry() {
 
 # Action handler: List/switch conversations
 function _forge_action_conversation() {
+    local input_text="$1"
+    
     echo
+    
+    # If an ID is provided directly, use it
+    if [[ -n "$input_text" ]]; then
+        local conversation_id="$input_text"
+        
+        # Set the conversation as active
+        _FORGE_CONVERSATION_ID="$conversation_id"
+        
+        # Show conversation content
+        echo
+        _forge_exec conversation show "$conversation_id"
+        
+        # Show conversation info
+        _forge_exec conversation info "$conversation_id"
+        
+        # Print log about conversation switching
+        _forge_log success "Switched to conversation \033[1m${conversation_id}\033[0m"
+        
+        _forge_reset
+        return 0
+    fi
     
     # Get conversations list
     local conversations_output
@@ -293,7 +419,8 @@ function _forge_action_conversation() {
 
         # If there's a current conversation, position cursor on it
         if [[ -n "$current_id" ]]; then
-            local index=$(_forge_find_index "$conversations_output" "$current_id")
+            # For conversations, compare against the first field (conversation_id)
+            local index=$(_forge_find_index "$conversations_output" "$current_id" 1)
             fzf_args+=(--bind="start:pos($index)")
         fi
 
@@ -315,19 +442,104 @@ function _forge_action_conversation() {
             _forge_exec conversation info "$conversation_id"
             
             # Print log about conversation switching
-            echo "\033[36m⏺\033[0m \033[90m[$(date '+%H:%M:%S')] Switched to conversation \033[1m${conversation_id}\033[0m"
+            _forge_log success "Switched to conversation \033[1m${conversation_id}\033[0m"
             
         fi
     else
-        echo "\033[31m✗\033[0m No conversations found"
+        _forge_log error "No conversations found"
     fi
     
     _forge_reset
 }
 
-# Action handler: Select provider
+# Action handler: Select agent
+function _forge_action_agent() {
+    local input_text="$1"
+    
+    echo
+    
+    # If an agent ID is provided directly, use it
+    if [[ -n "$input_text" ]]; then
+        local agent_id="$input_text"
+        
+        # Validate that the agent exists
+        local agent_exists=$($_FORGE_BIN list agents --porcelain 2>/dev/null | grep -q "^${agent_id}\b" && echo "true" || echo "false")
+        if [[ "$agent_exists" == "false" ]]; then
+            _forge_log error "Agent '\033[1m${agent_id}\033[0m' not found"
+            _forge_reset
+            return 0
+        fi
+        
+        # Set the agent as active
+        _FORGE_ACTIVE_AGENT="$agent_id"
+        
+        # Print log about agent switching
+        _forge_log success "Switched to agent \033[1m${agent_id}\033[0m"
+        
+        _forge_reset
+        return 0
+    fi
+    
+    # Get agents list
+    local agents_output
+    agents_output=$($_FORGE_BIN list agents --porcelain 2>/dev/null)
+    
+    if [[ -n "$agents_output" ]]; then
+        # Get current agent ID
+        local current_agent="$_FORGE_ACTIVE_AGENT"
+        
+        # Sort agents alphabetically by name (first field)
+        local sorted_agents=$(echo "$agents_output" | sort)
+        
+        # Create prompt with current agent - show agent ID, title, provider, model and reasoning
+        local prompt_text="Agent ❯ "
+        local fzf_args=(
+            --prompt="$prompt_text"
+            --delimiter="$_FORGE_DELIMITER"
+            --with-nth="1,2,4,5,6"
+        )
+
+        # If there's a current agent, position cursor on it
+        if [[ -n "$current_agent" ]]; then
+            local index=$(_forge_find_index "$sorted_agents" "$current_agent")
+            fzf_args+=(--bind="start:pos($index)")
+        fi
+
+        local selected_agent
+        # Use fzf without preview for simple selection like provider/model
+        selected_agent=$(echo "$sorted_agents" | _forge_fzf "${fzf_args[@]}")
+        
+        if [[ -n "$selected_agent" ]]; then
+            # Extract the first field (agent ID)
+            local agent_id=$(echo "$selected_agent" | awk '{print $1}')
+            
+            # Set the selected agent as active
+            _FORGE_ACTIVE_AGENT="$agent_id"
+            
+            # Print log about agent switching
+            _forge_log success "Switched to agent \033[1m${agent_id}\033[0m"
+            
+        fi
+    else
+        _forge_log error "No agents found"
+    fi
+    
+    _forge_reset
+}
+
+# Action handler: Select provider# Action handler: Select provider
 function _forge_action_provider() {
-    _forge_select_and_set_config "list providers" "provider" "Provider" "$($_FORGE_BIN config get provider --porcelain)"
+    echo
+    local selected
+    selected=$(_forge_select_provider)
+    
+    if [[ -n "$selected" ]]; then
+        # Extract the second field (provider ID) from the selected line
+        # Format: "DisplayName  provider_id  host  status"
+        local provider_id=$(echo "$selected" | awk '{print $2}')
+        # Always use config set - it will handle authentication if needed
+        _forge_exec config set provider "$provider_id"
+    fi
     _forge_reset
 }
 
@@ -335,6 +547,44 @@ function _forge_action_provider() {
 function _forge_action_model() {
     _forge_select_and_set_config "list models" "model" "Model" "$($_FORGE_BIN config get model --porcelain)" "2,3.."
     _forge_reset
+}
+
+# Action handler: Commit changes with AI-generated message
+# Usage: :commit [additional context]
+function _forge_action_commit() {
+    local additional_context="$1"
+    local commit_message
+    # Generate AI commit message
+    echo
+    # Force color output even when not connected to TTY
+    # FORCE_COLOR: for indicatif spinner colors
+    # CLICOLOR_FORCE: for colored crate text colors
+    
+    # Build commit command with optional additional context
+    if [[ -n "$additional_context" ]]; then
+        commit_message=$(FORCE_COLOR=true CLICOLOR_FORCE=1 $_FORGE_BIN commit --preview --max-diff "$_FORGE_MAX_COMMIT_DIFF" $additional_context)
+    else
+        commit_message=$(FORCE_COLOR=true CLICOLOR_FORCE=1 $_FORGE_BIN commit --preview --max-diff "$_FORGE_MAX_COMMIT_DIFF")
+    fi
+    
+    # Proceed only if command succeeded
+    if [[ -n "$commit_message" ]]; then
+        # Check if there are staged changes to determine commit strategy
+        if git diff --staged --quiet; then
+            # No staged changes: commit all tracked changes with -a flag
+            BUFFER="git commit -a -m '$commit_message'"
+        else
+            # Staged changes exist: commit only what's staged
+            BUFFER="git commit -m '$commit_message'"
+        fi
+        # Move cursor to end of buffer for immediate execution
+        CURSOR=${#BUFFER}
+        # Refresh display to show the new command
+        zle reset-prompt
+    else
+        echo "$commit_message"
+        _forge_reset
+    fi
 }
 
 # Action handler: Show tools
@@ -346,6 +596,139 @@ function _forge_action_tools() {
     _forge_reset
 }
 
+
+# Action handler: Open external editor for command composition
+function _forge_action_editor() {
+    local initial_text="$1"
+    echo
+    
+    # Determine editor in order of preference: FORGE_EDITOR > EDITOR > nano
+    local editor_cmd="${FORGE_EDITOR:-${EDITOR:-nano}}"
+    
+    # Validate editor exists
+    if ! command -v "${editor_cmd%% *}" &>/dev/null; then
+        _forge_log error "Editor not found: $editor_cmd (set FORGE_EDITOR or EDITOR)"
+        _forge_reset
+        return 1
+    fi
+    
+    # Create .forge directory if it doesn't exist
+    local forge_dir=".forge"
+    if [[ ! -d "$forge_dir" ]]; then
+        mkdir -p "$forge_dir" || {
+            _forge_log error "Failed to create .forge directory"
+            _forge_reset
+            return 1
+        }
+    fi
+    
+    # Create temporary file with git-like naming: FORGE_EDITMSG
+    local temp_file="${forge_dir}/FORGE_EDITMSG"
+    touch "$temp_file" || {
+        _forge_log error "Failed to create temporary file"
+        _forge_reset
+        return 1
+    }
+    
+    # Ensure cleanup on exit
+    trap "rm -f '$temp_file'" EXIT INT TERM
+    
+    # Pre-populate with initial text if provided
+    if [[ -n "$initial_text" ]]; then
+        echo "$initial_text" > "$temp_file"
+    fi
+    
+    # Open editor
+    eval "$editor_cmd '$temp_file'"
+    local editor_exit_code=$?
+    
+    if [ $editor_exit_code -ne 0 ]; then
+        _forge_log error "Editor exited with error code $editor_exit_code"
+        _forge_reset
+        return 1
+    fi
+    
+    # Read and process content
+    local content
+    content=$(cat "$temp_file" | tr -d '\r')
+    
+    if [ -z "$content" ]; then
+        _forge_log info "Editor closed with no content"
+        _forge_reset
+        return 0
+    fi
+    
+        # Insert into buffer with : prefix (only if not already present)
+    if [[ "$content" =~ ^: ]]; then
+        BUFFER="$content"
+    else
+        BUFFER=": $content"
+    fi
+    CURSOR=${#BUFFER}
+    
+    _forge_log info "Command ready - press Enter to execute"
+    zle reset-prompt
+}
+
+# Action handler: Show skills
+function _forge_action_skill() {
+    echo
+    _forge_exec list skill
+    _forge_reset
+}
+
+# Action handler: Generate shell command from natural language
+# Usage: :? <description>
+function _forge_action_suggest() {
+    local description="$1"
+    
+    if [[ -z "$description" ]]; then
+        _forge_log error "Please provide a command description"
+        _forge_reset
+        return 0
+    fi
+    
+    echo
+    # Generate the command
+    local generated_command
+    generated_command=$(FORCE_COLOR=true CLICOLOR_FORCE=1 _forge_exec suggest "$description")
+    
+    if [[ -n "$generated_command" ]]; then
+        # Replace the buffer with the generated command
+        BUFFER="$generated_command"
+        CURSOR=${#BUFFER}
+        zle reset-prompt
+    else
+        _forge_log error "Failed to generate command"
+        _forge_reset
+    fi
+}
+
+# Action handler: Login to provider
+function _forge_action_login() {
+    echo
+    local selected
+    selected=$(_forge_select_provider)
+    if [[ -n "$selected" ]]; then
+        # Extract the second field (provider ID)
+        local provider=$(echo "$selected" | awk '{print $2}')
+        _forge_exec provider login "$provider"
+    fi
+    _forge_reset
+}
+
+# Action handler: Logout from provider
+function _forge_action_logout() {
+    echo
+    local selected
+    selected=$(_forge_select_provider "available")
+    if [[ -n "$selected" ]]; then
+        # Extract the second field (provider ID)
+        local provider=$(echo "$selected" | awk '{print $2}')
+        _forge_exec provider logout "$provider"
+    fi
+    _forge_reset
+}
 # Action handler: Set active agent or execute command
 function _forge_action_default() {
     local user_action="$1"
@@ -355,10 +738,28 @@ function _forge_action_default() {
     if [[ -n "$user_action" ]]; then
         local commands_list=$(_forge_get_commands)
         if [[ -n "$commands_list" ]]; then
-            # Check if the user_action is in the list of valid commands
-            if ! echo "$commands_list" | grep -q "^${user_action}\b"; then
+            # Check if the user_action is in the list of valid commands and extract the row
+            local command_row=$(echo "$commands_list" | grep "^${user_action}\b")
+            if [[ -z "$command_row" ]]; then
                 echo
-                echo "\033[31m⏺\033[0m \033[90m[$(date '+%H:%M:%S')]\033[0m \033[1;31mERROR:\033[0m Command '\033[1m${user_action}\033[0m' not found"
+                _forge_log error "Command '\033[1m${user_action}\033[0m' not found"
+                _forge_reset
+                return 0
+            fi
+            
+            # Extract the command type from the last field of the row
+            local command_type="${command_row##* }"
+            if [[ "$command_type" == "custom" ]]; then
+                # Generate conversation ID if needed
+                [[ -z "$_FORGE_CONVERSATION_ID" ]] && _FORGE_CONVERSATION_ID=$($_FORGE_BIN conversation new)
+                
+                echo
+                # Execute custom command with run subcommand
+                if [[ -n "$input_text" ]]; then
+                    _forge_exec cmd --cid "$_FORGE_CONVERSATION_ID" "$user_action" "$input_text"
+                else
+                    _forge_exec cmd --cid "$_FORGE_CONVERSATION_ID" "$user_action"
+                fi
                 _forge_reset
                 return 0
             fi
@@ -371,7 +772,7 @@ function _forge_action_default() {
             echo
             # Set the agent in the local variable
             _FORGE_ACTIVE_AGENT="$user_action"
-            echo "\033[33m⏺\033[0m \033[90m[$(date '+%H:%M:%S')] \033[1;37m${_FORGE_ACTIVE_AGENT:u}\033[0m \033[90mis now the active agent\033[0m"
+            _forge_log info "\033[1;37m${_FORGE_ACTIVE_AGENT:u}\033[0m \033[90mis now the active agent\033[0m"
         fi
         _forge_reset
         return 0
@@ -409,7 +810,7 @@ function forge-accept-line() {
         # Action with or without parameters: :foo or :foo bar baz
         user_action="${match[1]}"
         input_text="${match[3]:-}"  # Use empty string if no parameters
-        elif [[ "$BUFFER" =~ "^: (.*)$" ]]; then
+    elif [[ "$BUFFER" =~ "^: (.*)$" ]]; then
         # Default action with parameters: : something
         user_action=""
         input_text="${match[1]}"
@@ -432,6 +833,10 @@ function forge-accept-line() {
         ;;
     esac
     
+    # ⚠️  IMPORTANT: When adding a new command here, you MUST also update:
+    #     crates/forge_main/src/built_in_commands.json
+    #     Add a new entry: {"command": "name", "description": "Description [alias: x]"}
+    #
     # Dispatch to appropriate action handler using pattern matching
     case "$user_action" in
         new|n)
@@ -443,26 +848,47 @@ function forge-accept-line() {
         env|e)
             _forge_action_env
         ;;
-        dump)
+        dump|d)
             _forge_action_dump "$input_text"
         ;;
         compact)
             _forge_action_compact
         ;;
-        retry)
+        retry|r)
             _forge_action_retry
         ;;
-        conversation)
-            _forge_action_conversation
+        agent|a)
+            _forge_action_agent "$input_text"
         ;;
-        provider)
+        conversation|c)
+            _forge_action_conversation "$input_text"
+        ;;
+        provider|p)
             _forge_action_provider
         ;;
-        model)
+        model|m)
             _forge_action_model
         ;;
-        tools)
+        tools|t)
             _forge_action_tools
+        ;;
+        skill)
+            _forge_action_skill
+        ;;
+        edit|ed)
+            _forge_action_editor "$input_text"
+        ;;
+        commit)
+            _forge_action_commit "$input_text"
+        ;;
+        suggest|s)
+            _forge_action_suggest "$input_text"
+        ;;
+        login)
+            _forge_action_login
+        ;;
+        logout)
+            _forge_action_logout
         ;;
         *)
             _forge_action_default "$user_action" "$input_text"
@@ -475,9 +901,466 @@ zle -N forge-accept-line
 # Register completions
 zle -N forge-completion
 
+# Custom bracketed-paste handler to fix syntax highlighting after paste
+function forge-bracketed-paste() {
+    zle .$WIDGET "$@"
+    zle reset-prompt
+}
+
+# Register the bracketed paste widget to fix highlighting on paste
+zle -N bracketed-paste forge-bracketed-paste
+
+
+
+# ===== FORGE KEYBOARD SHORTCUTS =====
+# Enable/disable shortcuts (default: enabled)
+if [[ -z "$FORGE_ENABLE_SHORTCUTS" ]]; then
+    FORGE_ENABLE_SHORTCUTS="true"
+fi
+
+# Only proceed if shortcuts are enabled
+if [[ "$FORGE_ENABLE_SHORTCUTS" == "true" ]]; then
+
+# =============================================================================
+# SHORTCUT FUNCTIONS
+# =============================================================================
+
+# Alt+;: Add : prefix to current buffer
+FORGE_SHORTCUT_IN_PROGRESS=false
+
+function forge-shortcut-colon-prefix() {
+    # Prevent multiple rapid executions
+    if [[ "$FORGE_SHORTCUT_IN_PROGRESS" == "true" ]]; then
+        return
+    fi
+    FORGE_SHORTCUT_IN_PROGRESS=true
+    
+    # Remove trailing semicolon if present (some terminals add it after Ctrl+Alt+;)
+    if [[ "$BUFFER" =~ ";$" ]]; then
+        BUFFER="${BUFFER%;}"
+    fi
+    
+    if [[ -n "$BUFFER" ]]; then
+        # Buffer has content - check if it already starts with ":"
+        local trimmed_buffer=$(echo "$BUFFER" | sed 's/^[[:space:]]*//')
+        
+        if [[ "${trimmed_buffer:0:1}" == ":" ]]; then
+            # Buffer already starts with :, do nothing
+            FORGE_SHORTCUT_IN_PROGRESS=false
+            return
+        else
+            # Buffer doesn't start with :, prepend : prefix
+            BUFFER=": $BUFFER"
+        fi
+    else
+        # Buffer empty - insert : prefix only
+        BUFFER=": "
+    fi
+    
+    # Position cursor at end of buffer
+    CURSOR=${#BUFFER}
+    
+    # Reset prompt only if ZLE is active
+    if [[ -n "$ZLE_VERSION" ]]; then
+        zle reset-prompt 2>/dev/null || true
+    fi
+    
+    # Reset the flag
+    FORGE_SHORTCUT_IN_PROGRESS=false
+}
+
+# Ctrl+e: Open editor with current buffer content
+function forge-shortcut-editor-with-content() {
+    local current_buffer="$BUFFER"
+    local prefix=""
+    local content_for_editor="$current_buffer"
+    
+    # Check if buffer starts with :word pattern (command with content)
+    if [[ "$current_buffer" =~ ^:[^[:space:]]+[[:space:]]+(.*)$ ]]; then
+        # Extract prefix (:word) and content for editor
+        prefix="${current_buffer%% *}"
+        content_for_editor="${current_buffer#* }"
+    # Check if buffer starts with : (just colon with space and content)
+    elif [[ "$current_buffer" =~ ^:[[:space:]]+(.*)$ ]]; then
+        # Extract prefix (:) and content for editor
+        prefix=":"
+        content_for_editor="${match[1]}"
+    fi
+    
+    # Call editor with the appropriate content
+    _forge_action_editor_with_prefix "$content_for_editor" "$prefix"
+}
+
+# Internal function: Open editor with content and restore with prefix
+function _forge_action_editor_with_prefix() {
+    local initial_text="$1"
+    local original_prefix="$2"
+    echo
+    
+    # Debug: Show what we received
+    _forge_log info "Debug: Received text: '${initial_text}', prefix: '${original_prefix}'"
+    
+    # Determine editor in order of preference: FORGE_EDITOR > EDITOR > nano
+    local editor_cmd="${FORGE_EDITOR:-${EDITOR:-nano}}"
+    
+    # Validate editor exists
+    if ! command -v "${editor_cmd%% *}" &>/dev/null; then
+        _forge_log error "Editor not found: $editor_cmd (set FORGE_EDITOR or EDITOR)"
+        _forge_reset
+        return 1
+    fi
+    
+    # Create .forge directory if it doesn't exist
+    local forge_dir=".forge"
+    if [[ ! -d "$forge_dir" ]]; then
+        mkdir -p "$forge_dir" || {
+            _forge_log error "Failed to create .forge directory"
+            _forge_reset
+            return 1
+        }
+    fi
+    
+    # Create temporary file with git-like naming: FORGE_EDITMSG
+    local temp_file="${forge_dir}/FORGE_EDITMSG"
+    touch "$temp_file" || {
+        _forge_log error "Failed to create temporary file"
+        _forge_reset
+        return 1
+    }
+    
+    # Ensure cleanup on exit
+    trap "rm -f '$temp_file'" EXIT INT TERM
+    
+    # Pre-populate with initial text if provided
+    if [[ -n "$initial_text" ]]; then
+        echo "$initial_text" > "$temp_file"
+    fi
+    
+    # Open editor
+    eval "$editor_cmd '$temp_file'"
+    local editor_exit_code=$?
+    
+    if [ $editor_exit_code -ne 0 ]; then
+        _forge_log error "Editor exited with error code $editor_exit_code"
+        _forge_reset
+        return 1
+    fi
+    
+    # Read and process content
+    local content
+    content=$(cat "$temp_file" | tr -d '\r')
+    
+    if [ -z "$content" ]; then
+        _forge_log info "Editor closed with no content"
+        _forge_reset
+        return 0
+    fi
+    
+    # Reconstruct buffer with original prefix if it existed
+    if [[ -n "$original_prefix" ]]; then
+        BUFFER="$original_prefix $content"
+    else
+        BUFFER=": $content"
+    fi
+    CURSOR=${#BUFFER}
+    
+    _forge_log info "Command ready - press Enter to execute"
+    # Only reset prompt if ZLE is active (interactive shell)
+    if [[ $options[zle] = on ]]; then
+        zle reset-prompt
+    fi
+}
+
+# =============================================================================
+# REGISTRATION AND BINDING
+# =============================================================================
+
+# Register ZLE widgets for each shortcut function
+zle -N forge-shortcut-colon-prefix
+zle -N forge-shortcut-editor-with-content
+
+# Bind keyboard shortcuts with platform-specific detection
+# Detect operating system for platform-specific key bindings
+case "$(uname -s)" in
+    Darwin*)
+        # macOS-specific key bindings
+        bindkey '\e;' forge-shortcut-colon-prefix         # Option+; (most common)
+        bindkey '^[;' forge-shortcut-colon-prefix          # Option+; alternative
+        bindkey '\e[1;3A' forge-shortcut-colon-prefix      # Option+; for some terminals
+        ;;
+    Linux*|CYGWIN*|MINGW*|MSYS*)
+        # Linux/Windows key bindings
+        bindkey '\e;' forge-shortcut-colon-prefix         # Alt+;
+        bindkey '\e[1;3F' forge-shortcut-colon-prefix  # Alternative Alt+; for some terminals
+        bindkey '^[;' forge-shortcut-colon-prefix          # Another Alt+; variant
+        ;;
+    *)
+        # Default to Linux bindings for unknown platforms
+        bindkey '\e;' forge-shortcut-colon-prefix         # Alt+;
+        bindkey '\e[1;3F' forge-shortcut-colon-prefix  # Alternative Alt+; for some terminals
+        bindkey '^[;' forge-shortcut-colon-prefix          # Another Alt+; variant
+        ;;
+esac
+bindkey '^e' forge-shortcut-editor-with-content   # Ctrl+e → editor with content
+
+# =============================================================================
+# INITIALIZATION MESSAGE
+# =============================================================================
+
+# Show initialization message once per session
+if [[ -z "$FORGE_SHORTCUTS_LOADED" ]]; then
+    if command -v _forge_log >/dev/null 2>&1; then
+        case "$(uname -s)" in
+            Darwin*)
+                _forge_log info "Forge shortcuts enabled: Option+; (prefix), Ctrl+e (editor)"
+                ;;
+            *)
+                _forge_log info "Forge shortcuts enabled: Alt+; (prefix), Ctrl+e (editor)"
+                ;;
+        esac
+    else
+        case "$(uname -s)" in
+            Darwin*)
+                echo "⏺ Forge shortcuts enabled: Option+; (prefix), Ctrl+e (editor)"
+                ;;
+            *)
+                echo "⏺ Forge shortcuts enabled: Alt+; (prefix), Ctrl+e (editor)"
+                ;;
+        esac
+    fi
+    export FORGE_SHORTCUTS_LOADED=1
+fi
+
+# End of shortcuts section
+fi
 
 # Bind Enter to our custom accept-line that transforms :commands
 bindkey '^M' forge-accept-line
 bindkey '^J' forge-accept-line
 # Update the Tab binding to use the new completion widget
 bindkey '^I' forge-completion  # Tab for both @ and :command completion
+
+#################################################################################
+# POWERLEVEL10K INTEGRATION
+#################################################################################
+# Automatically configure Powerlevel10k prompt segments for Forge
+# This section only runs if Powerlevel10k is detected (p10k command exists)
+
+if (( $+functions[p10k] )) || [[ -n "$POWERLEVEL9K_MODE" ]]; then
+
+  #################################[ forge_agent: forge active agent ]#################################
+  # Custom segment to display the currently active Forge agent
+  # This function runs on every prompt render to show which agent is handling tasks
+  #
+  # POSITIONING:
+  # - Added to POWERLEVEL9K_LEFT_PROMPT_ELEMENTS as the FIRST item
+  # - Appears on the far LEFT of your prompt in BOLD UPPERCASE
+  #
+  # COLOR:
+  # - DIMMED GRAY (242) when no active conversation (_FORGE_CONVERSATION_ID is empty)
+  # - WHITE (231) when there's an active conversation
+  function prompt_forge_agent() {
+    # Check if $_FORGE_ACTIVE_AGENT environment variable is set
+    if [[ -n "$_FORGE_ACTIVE_AGENT" ]]; then
+      # Convert the agent name to UPPERCASE using ${(U)variable} syntax
+      local agent_upper="${(U)_FORGE_ACTIVE_AGENT}"
+      
+      # Determine color based on conversation state:
+      # - 242 (dimmed gray) = no active conversation
+      # - 231 (white) = active conversation
+      local segment_color=242
+      if [[ -n "$_FORGE_CONVERSATION_ID" ]]; then
+        segment_color=231
+      fi
+      
+      # Display the prompt segment using p10k:
+      # -f $segment_color : Set foreground color based on conversation state
+      # -t "$agent_upper" : Set the text content to the uppercase agent name
+      p10k segment -f $segment_color -t "$agent_upper"
+    fi
+  }
+
+  # Instant prompt version of forge_agent
+  # This enables the segment to appear in instant prompt (fast startup mode)
+  function instant_prompt_forge_agent() {
+    prompt_forge_agent
+  }
+
+  # Customization: Make the forge_agent text BOLD
+  # %B = Start bold, %b = End bold
+  # Color is handled dynamically by prompt_forge_agent function
+  typeset -g POWERLEVEL9K_FORGE_AGENT_CONTENT_EXPANSION='%B${(U)_FORGE_ACTIVE_AGENT}%b'
+
+  #################################[ forge_model: forge current model ]#################################
+  # Custom segment to display the current forge model configuration
+  # This function runs on every prompt render to show which AI model is currently active
+  #
+  # POSITIONING:
+  # - Added to POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS as the FIRST item
+  # - Appears on the far RIGHT of your prompt
+  #
+  # COLOR:
+  # - DIMMED GRAY (242) when no active conversation (_FORGE_CONVERSATION_ID is empty)
+  # - CYAN (39) when there's an active conversation
+  #
+  # INDICATOR:
+  # - ○ (empty circle) when idle (no conversation)
+  # - ● (filled circle) when active (conversation in progress)
+  function prompt_forge_model() {
+    local model_output
+    
+    # Determine which forge binary to use:
+    # 1. First try _FORGE_BIN (plugin internal variable)
+    # 2. Then try FORGE_BIN environment variable (for development/debugging)
+    # 3. Fall back to 'forge' command in PATH (for production)
+    local forge_cmd="${_FORGE_BIN:-${FORGE_BIN:-forge}}"
+    
+    # Execute 'forge config get model' to retrieve the current model
+    # Suppress errors (2>/dev/null) to avoid cluttering the prompt if forge isn't available
+    model_output=$($forge_cmd config get model 2>/dev/null)
+    
+    # Only display the segment if we successfully got a model name
+    if [[ -n "$model_output" ]]; then
+      # Determine color and indicator based on conversation state:
+      # - 242 (dimmed gray) + ○ = no active conversation (idle)
+      # - 39 (cyan) + ● = active conversation
+      local segment_color=242
+      local indicator="○"
+      if [[ -n "$_FORGE_CONVERSATION_ID" ]]; then
+        segment_color=39
+        indicator="●"
+      fi
+      
+      # Display the prompt segment using p10k:
+      # -f $segment_color : Set foreground color based on conversation state
+      # -i '$indicator'   : Display conversation indicator (○ idle or ● active)
+      # -t "$model_output" : Set the text content to the model name
+      p10k segment -f $segment_color -i "$indicator" -t "$model_output"
+    fi
+  }
+
+  # Instant prompt version of forge_model
+  # This enables the segment to appear in instant prompt (fast startup mode)
+  function instant_prompt_forge_model() {
+    prompt_forge_model
+  }
+
+  #################################[ Update Prompt Elements ]#################################
+  # Prepend forge_agent to LEFT prompt (appears first/leftmost)
+  # Only add if not already present
+  if [[ ! " ${POWERLEVEL9K_LEFT_PROMPT_ELEMENTS[*]} " =~ " forge_agent " ]]; then
+    POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(forge_agent "${POWERLEVEL9K_LEFT_PROMPT_ELEMENTS[@]}")
+  fi
+
+  # Prepend forge_model to RIGHT prompt (appears first/rightmost)
+  # Only add if not already present
+  if [[ ! " ${POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS[*]} " =~ " forge_model " ]]; then
+    POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(forge_model "${POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS[@]}")
+  fi
+
+fi
+# End of Powerlevel10k integration
+
+#################################################################################
+# PLAIN ZSH PROMPT INTEGRATION
+#################################################################################
+# Automatically configure zsh prompt for Forge (for users without Powerlevel10k)
+# This section only runs if Powerlevel10k is NOT detected
+
+if ! (( $+functions[p10k] )) && [[ -z "$POWERLEVEL9K_MODE" ]]; then
+
+  # Store original prompts to preserve user's existing configuration
+  # We'll prepend/append our forge info to these
+  typeset -g _FORGE_ORIGINAL_PROMPT="${PROMPT}"
+  typeset -g _FORGE_ORIGINAL_RPROMPT="${RPROMPT}"
+
+  #################################[ _forge_zsh_prompt_agent ]#################################
+  # Returns the active agent formatted for display in PROMPT
+  # Format: BOLD UPPERCASE agent name
+  #
+  # COLOR:
+  # - DIMMED GRAY (242) when no active conversation (_FORGE_CONVERSATION_ID is empty)
+  # - WHITE (231) when there's an active conversation
+  function _forge_zsh_prompt_agent() {
+    if [[ -n "$_FORGE_ACTIVE_AGENT" ]]; then
+      # Determine color based on conversation state:
+      # - 242 (dimmed gray) = no active conversation
+      # - 231 (white) = active conversation
+      local agent_color=242
+      if [[ -n "$_FORGE_CONVERSATION_ID" ]]; then
+        agent_color=231
+      fi
+      
+      # %B = bold, %F{color} = set color, %f = reset foreground, %b = reset bold
+      # ${(U)var} = uppercase the variable
+      echo "%B%F{$agent_color}${(U)_FORGE_ACTIVE_AGENT}%f%b "
+    fi
+  }
+
+  #################################[ _forge_zsh_prompt_model ]#################################
+  # Returns the current model formatted for display in RPROMPT
+  # Format: Indicator + model name
+  #
+  # COLOR:
+  # - DIMMED GRAY (242) when no active conversation (_FORGE_CONVERSATION_ID is empty)
+  # - CYAN (39) when there's an active conversation
+  #
+  # INDICATOR:
+  # - ○ (empty circle) when idle (no conversation)
+  # - ● (filled circle) when active (conversation in progress)
+  function _forge_zsh_prompt_model() {
+    local forge_cmd="${_FORGE_BIN:-${FORGE_BIN:-forge}}"
+    local model_output
+    model_output=$($forge_cmd config get model 2>/dev/null)
+    
+    if [[ -n "$model_output" ]]; then
+      # Determine color and indicator based on conversation state:
+      # - 242 (dimmed gray) + ○ = no active conversation (idle)
+      # - 39 (cyan) + ● = active conversation
+      local segment_color=242
+      local indicator="○"
+      if [[ -n "$_FORGE_CONVERSATION_ID" ]]; then
+        segment_color=39
+        indicator="●"
+      fi
+      
+      # %F{color} = set foreground color, %f = reset foreground
+      echo "%F{$segment_color}${indicator} ${model_output}%f"
+    fi
+  }
+
+  #################################[ _forge_zsh_precmd ]#################################
+  # Precmd hook that updates PROMPT and RPROMPT before each prompt display
+  # This ensures the agent and model are always current
+  function _forge_zsh_precmd() {
+    # Build LEFT prompt: [AGENT] + original prompt
+    # Only add agent prefix if _FORGE_ACTIVE_AGENT is set
+    if [[ -n "$_FORGE_ACTIVE_AGENT" ]]; then
+      PROMPT="$(_forge_zsh_prompt_agent)${_FORGE_ORIGINAL_PROMPT}"
+    else
+      PROMPT="${_FORGE_ORIGINAL_PROMPT}"
+    fi
+    
+    # Build RIGHT prompt: original rprompt + [MODEL]
+    local model_segment="$(_forge_zsh_prompt_model)"
+    if [[ -n "$model_segment" ]]; then
+      if [[ -n "$_FORGE_ORIGINAL_RPROMPT" ]]; then
+        RPROMPT="${_FORGE_ORIGINAL_RPROMPT} ${model_segment}"
+      else
+        RPROMPT="${model_segment}"
+      fi
+    else
+      RPROMPT="${_FORGE_ORIGINAL_RPROMPT}"
+    fi
+  }
+
+  # Register the precmd hook
+  # Using add-zsh-hook if available (from zsh/hooks), otherwise append to precmd_functions
+  if (( $+functions[add-zsh-hook] )); then
+    add-zsh-hook precmd _forge_zsh_precmd
+  else
+    precmd_functions+=(_forge_zsh_precmd)
+  fi
+
+fi
+# End of Plain ZSH integration

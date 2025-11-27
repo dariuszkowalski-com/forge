@@ -45,13 +45,14 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
         command: String,
         cwd: PathBuf,
         keep_ansi: bool,
+        silent: bool,
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<ShellOutput> {
         Self::validate_command(&command)?;
 
         let mut output = self
             .infra
-            .execute_command(command, cwd, false, env_vars)
+            .execute_command(command, cwd, silent, env_vars)
             .await?;
 
         if !keep_ansi {
@@ -64,6 +65,7 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -117,6 +119,10 @@ mod tests {
         fn get_env_var(&self, _key: &str) -> Option<String> {
             Some("mock_value".to_string())
         }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
     }
 
     #[tokio::test]
@@ -129,6 +135,7 @@ mod tests {
             .execute(
                 "echo hello".to_string(),
                 PathBuf::from("."),
+                false,
                 false,
                 Some(vec!["PATH".to_string(), "HOME".to_string()]),
             )
@@ -144,7 +151,13 @@ mod tests {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
 
         let actual = fixture
-            .execute("echo hello".to_string(), PathBuf::from("."), false, None)
+            .execute(
+                "echo hello".to_string(),
+                PathBuf::from("."),
+                false,
+                false,
+                None,
+            )
             .await
             .unwrap();
 
@@ -162,6 +175,7 @@ mod tests {
             .execute(
                 "echo hello".to_string(),
                 PathBuf::from("."),
+                false,
                 false,
                 Some(vec![]),
             )
