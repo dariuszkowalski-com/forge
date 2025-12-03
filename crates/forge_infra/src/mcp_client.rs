@@ -96,6 +96,15 @@ impl ForgeMcpClient {
 
     async fn create_connection(&self) -> anyhow::Result<Arc<RmcpClient>> {
         let config = self.get_resolved_config()?;
+        
+        // Check for ZAI servers and use proxy
+        if let forge_domain::McpServerConfig::Http(http) = &config {
+            if http.url.contains("api.z.ai") {
+                println!("🚀 ZAI server detected in mcp_client.rs, attempting proxy...");
+                return self.create_zai_proxy_connection(http).await;
+            }
+        }
+        
         let client = match config {
             McpServerConfig::Stdio(stdio) => {
                 let mut cmd = Command::new(stdio.command.clone());
@@ -106,10 +115,28 @@ impl ForgeMcpClient {
 
                 cmd.args(&stdio.args).kill_on_drop(true);
 
-                // Use builder pattern to capture and ignore stderr to silence MCP logs
-                let (transport, _stderr) = TokioChildProcess::builder(cmd)
+                // Capture stderr for debugging when verbose logging is enabled
+                let (transport, stderr) = TokioChildProcess::builder(cmd)
                     .stderr(std::process::Stdio::piped())
                     .spawn()?;
+                
+                // Log stderr in background task when debug logging is enabled
+                if let Some(mut stderr) = stderr {
+                    let server_name = stdio.command.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut buffer = String::new();
+                        if let Ok(bytes_read) = stderr.read_to_string(&mut buffer).await {
+                            if bytes_read > 0 && !buffer.trim().is_empty() {
+                                tracing::error!(
+                                    server = %server_name,
+                                    stderr = %buffer.trim(),
+                                    "MCP server stderr output"
+                                );
+                            }
+                        }
+                    });
+                }
 
                 self.client_info().serve(transport).await?
             }
@@ -138,6 +165,197 @@ impl ForgeMcpClient {
         };
 
         Ok(Arc::new(client))
+    }
+
+    /// Create ZAI proxy connection using built-in Forge proxy
+    async fn create_zai_proxy_connection(&self, http: &McpHttpServer) -> anyhow::Result<Arc<RmcpClient>> {
+        tracing::info!("🚀 Using Forge built-in ZAI MCP proxy for: {}", http.url);
+        
+        // Extract model name from URL
+        let model_name = if http.url.contains("web_reader") {
+            "zai/web-reader"
+        } else if http.url.contains("web_search_prime") {
+            "zai/web-search-prime"
+        } else {
+            return Err(anyhow::anyhow!("Unsupported ZAI server URL: {}", http.url));
+        };
+
+        // Extract API key from Authorization header
+        let auth_header = http.headers
+            .get("Authorization")
+            .ok_or_else(|| anyhow::anyhow!("ZAI server requires Authorization header"))?;
+            
+        // Remove "Bearer " prefix to get the actual API key
+        let api_key = auth_header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| anyhow::anyhow!("ZAI server requires Bearer token in Authorization header"))?;
+
+        // Create a simple proxy command that acts as MCP server
+        // We'll use a simple Node.js script that forwards requests to ZAI API
+        let proxy_script = format!(r#"
+// Forge ZAI MCP Proxy Server
+const http = require('http');
+const https = require('https');
+
+const MODEL = "{}";
+const API_KEY = "{}";
+
+// ZAI API endpoints
+const ZAI_ENDPOINTS = {{
+    "zai/web-reader": "https://api.z.ai/api/mcp/web_reader/mcp",
+    "zai/web-search-prime": "https://api.z.ai/api/mcp/web_search_prime/mcp"
+}};
+
+const ENDPOINT = ZAI_ENDPOINTS[MODEL];
+if (!ENDPOINT) {{
+    console.error('Unsupported ZAI model:', MODEL);
+    process.exit(1);
+}}
+
+// Simple MCP server that forwards to ZAI API
+const server = http.createServer((req, res) => {{
+    let body = '';
+    
+    req.on('data', chunk => {{
+        body += chunk.toString();
+    }});
+    
+    req.on('end', () => {{
+        try {{
+            const mcpRequest = JSON.parse(body);
+            
+            // Forward request to ZAI API
+            const zaiReq = https.request(ENDPOINT, {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + API_KEY,
+                    'User-Agent': 'Forge-ZAI-Proxy/1.0'
+                }}
+            }});
+            
+            zaiReq.on('response', (zAIRes) => {{
+                let zaiBody = '';
+                
+                ZAIRes.on('data', chunk => {{
+                    zaiBody += chunk.toString();
+                }});
+                
+                ZAIRes.on('end', () => {{
+                    // Forward ZAI response back to MCP client
+                    res.writeHead(ZAIRes.statusCode, {{
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }});
+                    res.end(zaiBody);
+                }});
+            }});
+            
+            zaiReq.on('error', (error) => {{
+                console.error('ZAI API error:', error);
+                res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+                res.end(JSON.stringify({{
+                    jsonrpc: "2.0",
+                    id: mcpRequest.id || 1,
+                    error: {{
+                        code: -32603,
+                        message: "ZAI API error: " + error.message
+                    }}
+                }}));
+            }});
+            
+            zaiReq.write(body);
+            zaiReq.end();
+            
+        }} catch (error) {{
+            console.error('Proxy error:', error);
+            res.writeHead(400, {{ 'Content-Type': 'application/json' }});
+            res.end(JSON.stringify({{
+                jsonrpc: "2.0",
+                id: 1,
+                error: {{
+                    code: -32700,
+                    message: "Invalid MCP request: " + error.message
+                }}
+            }}));
+        }}
+    }});
+    
+    req.on('error', (error) => {{
+        console.error('Request error:', error);
+        res.writeHead(500);
+        res.end('Internal Server Error');
+    }});
+}});
+
+// Start proxy server on random port
+server.listen(0, () => {{
+    const port = server.address().port;
+    console.log(JSON.stringify({{
+        jsonrpc: "2.0",
+        id: 1,
+        result: {{
+            server_url: `http://localhost:${{port}}`,
+            proxy_info: "Forge ZAI MCP Proxy for " + MODEL
+        }}
+    }}));
+}});
+"#, model_name, api_key);
+
+        // Create temporary proxy script
+        let proxy_script_path = format!("/tmp/forge_zai_proxy_{}.js", std::process::id());
+        std::fs::write(&proxy_script_path, proxy_script)?;
+        
+        // Start proxy server
+        let mut cmd = Command::new("node");
+        cmd.arg(&proxy_script_path);
+        cmd.kill_on_drop(true);
+
+        // Capture stdout to get server URL
+        let (transport, stdout) = TokioChildProcess::builder(cmd)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        
+        // Read the server URL from stdout
+        if let Some(mut stdout) = stdout {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = String::new();
+            if let Ok(bytes_read) = stdout.read_to_string(&mut buffer).await {
+                if bytes_read > 0 {
+                    tracing::debug!("ZAI proxy stdout: {}", buffer.trim());
+                    
+                    // Parse the server URL from the proxy output
+                    if let Ok(response) = serde_json::from_str::<serde_json::Value>(&buffer) {
+                        if let Some(server_url) = response.get("result")
+                            .and_then(|r| r.get("server_url"))
+                            .and_then(|u| u.as_str()) {
+                            
+                            // Connect to the proxy server
+                            let proxy_client = self.reqwest_client(&McpHttpServer {
+                                url: server_url.to_string(),
+                                headers: std::collections::BTreeMap::new(),
+                                disable: false,
+                            })?;
+                            
+                            let transport = StreamableHttpClientTransport::with_client(
+                                proxy_client,
+                                StreamableHttpClientTransportConfig::with_uri(server_url.to_string()),
+                            );
+                            
+                            let client = self.client_info().serve(transport).await?;
+                            tracing::info!("✅ ZAI MCP proxy connected successfully for model: {}", model_name);
+                            
+                            // Clean up temporary script
+                            let _ = std::fs::remove_file(&proxy_script_path);
+                            
+                            return Ok(Arc::new(client));
+                        }
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!("Failed to start ZAI proxy server"))
     }
 
     fn reqwest_client(&self, config: &McpHttpServer) -> anyhow::Result<reqwest::Client> {

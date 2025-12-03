@@ -268,6 +268,10 @@ pub struct ListCommandGroup {
     /// Output in machine-readable format.
     #[arg(long, global = true)]
     pub porcelain: bool,
+
+    /// Enable verbose logging output.
+    #[arg(long, global = true, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -338,6 +342,10 @@ pub struct McpCommandGroup {
     /// Output in machine-readable format.
     #[arg(long, global = true)]
     pub porcelain: bool,
+
+    /// Enable verbose logging output.
+    #[arg(long, global = true, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -384,6 +392,8 @@ pub struct McpShowArgs {
     /// Name of the server to show details for.
     pub name: String,
 }
+
+
 
 /// Configuration scope for settings.
 #[derive(Copy, Clone, Debug, ValueEnum, Default)]

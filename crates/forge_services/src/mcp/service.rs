@@ -86,7 +86,22 @@ where
         config: McpServerConfig,
     ) -> anyhow::Result<()> {
         let env_vars = self.infra.get_env_vars();
-        let client = self.infra.connect(config, &env_vars).await?;
+        let result = self.infra.connect(config, &env_vars).await;
+        
+        // Check if this is a ZAI server error and preserve the detailed message
+        let client = match result {
+            Ok(client) => client,
+            Err(e) => {
+                // Check if error contains our ZAI-specific message
+                if e.to_string().contains("ZAI MCP servers") {
+                    // Return the original ZAI error without wrapping
+                    return Err(e);
+                }
+                // For other errors, wrap with context
+                return Err(e.context(format!("Failed to initiate MCP server: {server_name}")));
+            }
+        };
+        
         let client = Arc::new(C::from(client));
         self.insert_clients(server_name, client).await?;
 
@@ -120,8 +135,7 @@ where
             .map(|(name, server)| async move {
                 let conn = self
                     .connect(&name, server)
-                    .await
-                    .context(format!("Failed to initiate MCP server: {name}"));
+                    .await;
 
                 (name, conn)
             })

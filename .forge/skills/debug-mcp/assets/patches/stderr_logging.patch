@@ -1,0 +1,33 @@
+--- a/crates/forge_infra/src/mcp_client.rs
++++ b/crates/forge_infra/src/mcp_client.rs
+@@ -107,8 +107,20 @@
+                 cmd.args(&stdio.args).kill_on_drop(true);
+ 
+-                // Use builder pattern to capture and ignore stderr to silence MCP logs
+-                let (transport, _stderr) = TokioChildProcess::builder(cmd)
+-                    .stderr(std::process::Stdio::piped())
+-                    .spawn()?;
++                // Capture stderr for debugging when verbose logging is enabled
++                let (transport, stderr) = TokioChildProcess::builder(cmd)
++                    .stderr(std::process::Stdio::piped())
++                    .spawn()?;
++                
++                // Log stderr in background task when debug logging is enabled
++                if let Some(mut stderr) = stderr {
++                    let server_name = stdio.command.clone();
++                    tokio::spawn(async move {
++                        use tokio::io::AsyncReadExt;
++                        let mut buffer = String::new();
++                        if let Ok(bytes_read) = stderr.read_to_string(&mut buffer).await {
++                            if bytes_read > 0 && !buffer.trim().is_empty() {
++                                tracing::warn!(
++                                    server = %server_name,
++                                    stderr = %buffer.trim(),
++                                    "MCP server stderr output"
++                                );
++                            }
++                        }
++                    });
++                }
++
+                 self.client_info().serve(transport).await?

@@ -390,7 +390,7 @@ impl<A: API + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
                         self.on_show_tools(agent, porcelain).await?;
                     }
                     ListCommand::Mcp => {
-                        self.on_show_mcp_servers(porcelain).await?;
+                        self.on_show_mcp_servers(porcelain, list_group.verbose).await?;
                     }
                     ListCommand::Conversation => {
                         self.on_show_conversations(porcelain).await?;
@@ -444,7 +444,7 @@ impl<A: API + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
                     }
                 }
                 McpCommand::List => {
-                    self.on_show_mcp_servers(mcp_command.porcelain).await?;
+                    self.on_show_mcp_servers(mcp_command.porcelain, mcp_command.verbose).await?;
                 }
                 McpCommand::Remove(rm) => {
                     let name = forge_api::ServerName::from(rm.name);
@@ -478,6 +478,7 @@ impl<A: API + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
                     self.api.reload_mcp().await?;
                     self.writeln_title(TitleFormat::info("MCP reloaded"))?;
                 }
+
             },
             TopLevelCommand::Info { porcelain, conversation_id } => {
                 // Make sure to init model
@@ -1251,7 +1252,7 @@ impl<A: API + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
     }
 
     /// Displays all MCP servers with their available tools
-    async fn on_show_mcp_servers(&mut self, porcelain: bool) -> anyhow::Result<()> {
+    async fn on_show_mcp_servers(&mut self, porcelain: bool, verbose: bool) -> anyhow::Result<()> {
         self.spinner.start(Some("Loading MCP servers"))?;
         let mcp_servers = self.api.read_mcp_config(None).await?;
         let all_tools = self.api.get_tools().await?;
@@ -1293,13 +1294,18 @@ impl<A: API + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         if !all_tools.mcp.get_failures().is_empty() {
             info = info.add_title("FAILED");
             for (server_name, error) in all_tools.mcp.get_failures().iter() {
-                // Truncate error message for readability
-                let truncated_error = if error.len() > 80 {
-                    format!("{}...", &error[..77])
+                // Show full error in verbose mode, truncated otherwise
+                let error_msg = if verbose {
+                    error.clone()  // Full error in verbose mode
                 } else {
-                    error.clone()
+                    // Truncate error message for readability in normal mode
+                    if error.len() > 80 {
+                        format!("{}...", &error[..77])
+                    } else {
+                        error.clone()
+                    }
                 };
-                info = info.add_value(format!("[✗] {server_name} - {truncated_error}"));
+                info = info.add_value(format!("[✗] {server_name} - {error_msg}"));
             }
         }
 
@@ -3106,3 +3112,4 @@ impl<A: API + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         Ok(())
     }
 }
+

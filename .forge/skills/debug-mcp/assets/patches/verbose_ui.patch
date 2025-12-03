@@ -1,0 +1,28 @@
+--- a/crates/forge_main/src/ui.rs
++++ b/crates/forge_main/src/ui.rs
+@@ -1293,8 +1293,15 @@
+         // Show failed MCP servers
+         if !all_tools.mcp.get_failures().is_empty() {
+             info = info.add_title("FAILED");
+             for (server_name, error) in all_tools.mcp.get_failures().iter() {
+-                // Truncate error message for readability
+-                let truncated_error = if error.len() > 80 {
+-                    format!("{}...", &error[..77])
+-                } else {
+-                    error.clone()
+-                };
++                // Show full error in verbose mode, truncated otherwise
++                let error_msg = if self.cli.verbose {
++                    error.clone()  // Full error in verbose mode
++                } else {
++                    // Truncate error message for readability in normal mode
++                    if error.len() > 80 {
++                        format!("{}...", &error[..77])
++                    } else {
++                        error.clone()
++                    }
++                };
+-                info = info.add_value(format!("[✗] {server_name} - {truncated_error}"));
++                info = info.add_value(format!("[✗] {server_name} - {error_msg}"));
+             }
+         }
