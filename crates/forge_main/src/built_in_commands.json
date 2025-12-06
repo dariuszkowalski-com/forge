@@ -9,11 +9,11 @@
   },
   {
     "command": "provider",
-    "description": "Switch the providers [alias: p]"
+    "description": "Switch providers [alias: p]"
   },
   {
     "command": "model",
-    "description": "Switch the models [alias: m]"
+    "description": "Switch models [alias: m]"
   },
   {
     "command": "new",
@@ -74,5 +74,9 @@
   {
     "command": "clone",
     "description": "Clone and manage conversation context"
+  },
+  {
+    "command": "rename",
+    "description": "Rename a conversation [alias: rn]"
   }
 ]
