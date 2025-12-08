@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -5,8 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use forge_app::{
     CommandInfra, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra, FileInfoInfra,
-    FileReaderInfra, FileRemoverInfra, FileWriterInfra, HttpInfra, McpServerInfra, StrategyFactory,
-    UserInfra, WalkerInfra,
+    FileReaderInfra, FileRemoverInfra, FileWriterInfra, GrpcInfra, HttpInfra, McpServerInfra,
+    StrategyFactory, UserInfra, WalkerInfra,
 };
 use forge_domain::{
     AuthMethod, CommandOutput, Environment, FileInfo as FileInfoData, McpServerConfig, ProviderId,
@@ -25,6 +26,7 @@ use crate::fs_read::ForgeFileReadService;
 use crate::fs_read_dir::ForgeDirectoryReaderService;
 use crate::fs_remove::ForgeFileRemoveService;
 use crate::fs_write::ForgeFileWriteService;
+use crate::grpc::ForgeGrpcClient;
 use crate::http::ForgeHttpInfra;
 use crate::inquire::ForgeInquire;
 use crate::mcp_client::ForgeMcpClient;
@@ -46,8 +48,9 @@ pub struct ForgeInfra {
     inquire_service: Arc<ForgeInquire>,
     mcp_server: ForgeMcpServer,
     walker_service: Arc<ForgeWalkerService>,
-    http_service: Arc<ForgeHttpInfra>,
+    http_service: Arc<ForgeHttpInfra<ForgeFileWriteService>>,
     strategy_factory: Arc<ForgeAuthStrategyFactory>,
+    grpc_client: Arc<ForgeGrpcClient>,
 }
 
 impl ForgeInfra {
@@ -55,16 +58,21 @@ impl ForgeInfra {
         let environment_service = Arc::new(ForgeEnvironmentInfra::new(restricted, cwd));
         let env = environment_service.get_environment();
 
-        let http_service = Arc::new(ForgeHttpInfra::new(env.http.clone()));
+        let file_write_service = Arc::new(ForgeFileWriteService::new());
+        let http_service = Arc::new(ForgeHttpInfra::new(env.clone(), file_write_service.clone()));
+        let file_read_service = Arc::new(ForgeFileReadService::new());
+        let file_meta_service = Arc::new(ForgeFileMetaService);
+        let directory_reader_service = Arc::new(ForgeDirectoryReaderService);
+        let grpc_client = Arc::new(ForgeGrpcClient::new(env.workspace_server_url.clone()));
 
         Self {
-            file_read_service: Arc::new(ForgeFileReadService::new()),
-            file_write_service: Arc::new(ForgeFileWriteService::new()),
+            file_read_service,
+            file_write_service,
             file_remove_service: Arc::new(ForgeFileRemoveService::new()),
             environment_service,
-            file_meta_service: Arc::new(ForgeFileMetaService),
+            file_meta_service,
             create_dirs_service: Arc::new(ForgeCreateDirsService),
-            directory_reader_service: Arc::new(ForgeDirectoryReaderService),
+            directory_reader_service,
             command_executor_service: Arc::new(ForgeCommandExecutorService::new(
                 restricted,
                 env.clone(),
@@ -74,6 +82,7 @@ impl ForgeInfra {
             walker_service: Arc::new(ForgeWalkerService::new()),
             strategy_factory: Arc::new(ForgeAuthStrategyFactory::new()),
             http_service,
+            grpc_client,
         }
     }
 }
@@ -85,6 +94,10 @@ impl EnvironmentInfra for ForgeInfra {
 
     fn get_env_var(&self, key: &str) -> Option<String> {
         self.environment_service.get_env_var(key)
+    }
+
+    fn get_env_vars(&self) -> BTreeMap<String, String> {
+        self.environment_service.get_env_vars()
     }
 }
 
@@ -208,8 +221,12 @@ impl UserInfra for ForgeInfra {
 impl McpServerInfra for ForgeInfra {
     type Client = ForgeMcpClient;
 
-    async fn connect(&self, config: McpServerConfig) -> anyhow::Result<Self::Client> {
-        self.mcp_server.connect(config).await
+    async fn connect(
+        &self,
+        config: McpServerConfig,
+        env_vars: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Self::Client> {
+        self.mcp_server.connect(config, env_vars).await
     }
 }
 
@@ -244,6 +261,15 @@ impl HttpInfra for ForgeInfra {
 }
 #[async_trait::async_trait]
 impl DirectoryReaderInfra for ForgeInfra {
+    async fn list_directory_entries(
+        &self,
+        directory: &Path,
+    ) -> anyhow::Result<Vec<(PathBuf, bool)>> {
+        self.directory_reader_service
+            .list_directory_entries(directory)
+            .await
+    }
+
     async fn read_directory_files(
         &self,
         directory: &Path,
@@ -265,5 +291,15 @@ impl StrategyFactory for ForgeInfra {
     ) -> anyhow::Result<Self::Strategy> {
         self.strategy_factory
             .create_auth_strategy(provider_id, method, required_params)
+    }
+}
+
+impl GrpcInfra for ForgeInfra {
+    fn channel(&self) -> tonic::transport::Channel {
+        self.grpc_client.channel()
+    }
+
+    fn hydrate(&self) {
+        self.grpc_client.hydrate();
     }
 }

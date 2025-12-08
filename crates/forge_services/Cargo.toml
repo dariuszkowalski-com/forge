@@ -13,13 +13,14 @@ async-trait.workspace = true
 async-recursion.workspace = true
 
 forge_snaps.workspace = true
+forge_stream.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 derive_setters.workspace = true
 tokio-stream.workspace = true
 handlebars.workspace = true
 forge_fs.workspace = true
-
+dashmap.workspace = true
 
 anyhow.workspace = true
 futures.workspace = true
@@ -27,20 +28,10 @@ reqwest.workspace = true
 regex.workspace = true
 humantime.workspace = true
 thiserror.workspace = true
-tree-sitter.workspace = true
 html2md.workspace = true
 glob.workspace = true
 grep-searcher.workspace = true
 grep-regex.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-python.workspace = true
-tree-sitter-typescript.workspace = true
-tree-sitter-css.workspace = true
-tree-sitter-java.workspace = true
-tree-sitter-scala.workspace = true
-tree-sitter-go.workspace = true
-tree-sitter-cpp.workspace = true
-tree-sitter-ruby.workspace = true
 rust-embed.workspace = true
 base64.workspace = true
 strum_macros.workspace = true
@@ -66,5 +57,6 @@ mockito.workspace = true
 pretty_assertions.workspace = true
 tempfile.workspace = true
 fake = { version = "4.4.0", features = ["derive"] }
+forge_test_kit.workspace = true
 
 

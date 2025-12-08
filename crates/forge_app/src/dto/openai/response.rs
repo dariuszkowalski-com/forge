@@ -109,17 +109,22 @@ pub struct ResponseMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub refusal: Option<String>,
     pub reasoning_details: Option<Vec<ReasoningDetail>>,
+    // GitHub Copilot format (flat fields instead of array)
+    pub reasoning_text: Option<String>,
+    pub reasoning_opaque: Option<String>,
 }
 
-impl From<ReasoningDetail> for forge_domain::ReasoningFull {
+impl From<ReasoningDetail> for forge_domain::ReasoningDetail {
     fn from(detail: ReasoningDetail) -> Self {
-        forge_domain::ReasoningFull { text: detail.text, signature: detail.signature }
-    }
-}
-
-impl From<ReasoningDetail> for forge_domain::ReasoningPart {
-    fn from(detail: ReasoningDetail) -> Self {
-        forge_domain::ReasoningPart { text: detail.text, signature: detail.signature }
+        forge_domain::ReasoningDetail {
+            text: detail.text,
+            signature: detail.signature,
+            data: detail.data,
+            id: detail.id,
+            format: detail.format,
+            index: detail.index,
+            type_of: Some(detail.r#type),
+        }
     }
 }
 
@@ -161,6 +166,52 @@ impl From<ResponseUsage> for Usage {
                 .unwrap_or_default(),
             cost,
         }
+    }
+}
+
+/// Intermediate representation of GitHub Copilot reasoning fields
+struct GitHubCopilotReasoning {
+    text: Option<String>,
+    data: Option<String>,
+    r#type: Option<String>,
+}
+
+impl GitHubCopilotReasoning {
+    fn into_reasoning_detail(self) -> forge_domain::ReasoningDetail {
+        forge_domain::ReasoningDetail {
+            text: self.text,
+            data: self.data,
+            type_of: self.r#type,
+            ..Default::default()
+        }
+    }
+}
+
+/// Converts GitHub Copilot flat reasoning fields to structured reasoning
+/// details
+fn convert_github_copilot_reasoning(
+    reasoning_text: &Option<String>,
+    reasoning_opaque: &Option<String>,
+) -> Option<Vec<GitHubCopilotReasoning>> {
+    if reasoning_text.is_some() || reasoning_opaque.is_some() {
+        let mut details = Vec::new();
+        if let Some(text) = reasoning_text {
+            details.push(GitHubCopilotReasoning {
+                text: Some(text.clone()),
+                data: None,
+                r#type: Some("reasoning.text".to_string()),
+            });
+        }
+        if let Some(opaque) = reasoning_opaque {
+            details.push(GitHubCopilotReasoning {
+                text: None,
+                data: Some(opaque.clone()),
+                r#type: Some("reasoning.encrypted".to_string()),
+            });
+        }
+        Some(details)
+    } else {
+        None
     }
 }
 
@@ -214,6 +265,16 @@ impl TryFrom<Response> for ChatCompletionMessage {
                                 resp = resp.add_reasoning_detail(forge_domain::Reasoning::Full(
                                     converted_details,
                                 ));
+                            } else if let Some(details) = convert_github_copilot_reasoning(
+                                &message.reasoning_text,
+                                &message.reasoning_opaque,
+                            ) {
+                                resp = resp.add_reasoning_detail(forge_domain::Reasoning::Full(
+                                    details
+                                        .into_iter()
+                                        .map(GitHubCopilotReasoning::into_reasoning_detail)
+                                        .collect(),
+                                ));
                             }
 
                             if let Some(tool_calls) = &message.tool_calls {
@@ -257,6 +318,16 @@ impl TryFrom<Response> for ChatCompletionMessage {
                                 resp = resp.add_reasoning_detail(forge_domain::Reasoning::Part(
                                     converted_details,
                                 ));
+                            } else if let Some(details) = convert_github_copilot_reasoning(
+                                &delta.reasoning_text,
+                                &delta.reasoning_opaque,
+                            ) {
+                                resp = resp.add_reasoning_detail(forge_domain::Reasoning::Part(
+                                    details
+                                        .into_iter()
+                                        .map(GitHubCopilotReasoning::into_reasoning_detail)
+                                        .collect(),
+                                ));
                             }
 
                             if let Some(tool_calls) = &delta.tool_calls {
@@ -277,7 +348,12 @@ impl TryFrom<Response> for ChatCompletionMessage {
                     }
                     Ok(response)
                 } else {
-                    let default_response = ChatCompletionMessage::assistant(Content::full(""));
+                    let mut default_response = ChatCompletionMessage::assistant(Content::full(""));
+                    // No choices – this can happen with Ollama/LMStudio streaming where the final
+                    // chunk only contains usage information.
+                    if let Some(u) = usage {
+                        default_response.usage = Some(u.into());
+                    }
                     Ok(default_response)
                 }
             }
@@ -341,10 +417,11 @@ mod tests {
         assert!(Fixture::test_response_compatibility(event));
     }
 
-    #[test]
-    fn test_responses() -> anyhow::Result<()> {
-        let input = include_str!("./responses.jsonl").split("\n");
-        for (i, line) in input.enumerate() {
+    #[tokio::test]
+    async fn test_responses() -> anyhow::Result<()> {
+        let content = forge_test_kit::fixture!("/src/dto/openai/responses.jsonl").await;
+
+        for (i, line) in content.split('\n').enumerate() {
             let i = i + 1;
             let _: Response = serde_json::from_str(line).with_context(|| {
                 format!("Failed to parse response [responses.jsonl:{i}]: {line}")
@@ -398,6 +475,8 @@ mod tests {
                     tool_calls: None,
                     refusal: None,
                     reasoning_details: None,
+                    reasoning_text: None,
+                    reasoning_opaque: None,
                 },
                 error: Some(error_response.clone()),
             }],
@@ -431,6 +510,8 @@ mod tests {
                     tool_calls: None,
                     refusal: None,
                     reasoning_details: None,
+                    reasoning_text: None,
+                    reasoning_opaque: None,
                 },
                 error: Some(error_response.clone()),
             }],
@@ -464,6 +545,8 @@ mod tests {
                     tool_calls: None,
                     refusal: None,
                     reasoning_details: None,
+                    reasoning_text: None,
+                    reasoning_opaque: None,
                 },
                 error: None,
             }],

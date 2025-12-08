@@ -20,13 +20,15 @@ colored = "3.0.0"
 console = "0.16.0"
 dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
 convert_case = "0.8.0"
-derive_more = { version = "2.0.1", features = ["from", "display", "debug"] }
+
+crossterm = "0.28.1"
+derive_more = { version = "2.0.1", features = ["from", "display", "debug", "deref", "as_ref"] }
 derive_setters = "0.1.6"
 dirs = "6.0.0"
 dissimilar = "1.0.9"
 dotenvy = "0.15.7"
 futures = "0.3.31"
-gh-workflow = "0.8.0"
+gh-workflow = "0.8.1"
 glob = "0.3.3"
 grep-searcher = "0.1.14"
 grep-regex = "0.1.13"
@@ -82,19 +84,10 @@ tokio = { version = "1.47.1", features = [
 ] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7"
+tonic = { version = "0.14.2", features = ["tls-webpki-roots"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
-tree-sitter = "0.25.1"
-tree-sitter-rust = "0.24"
-tree-sitter-python = "0.23"
-tree-sitter-typescript = { version = "0.23" }
-tree-sitter-css = "0.23"
-tree-sitter-java = "0.23"
-tree-sitter-scala = "0.24"
-tree-sitter-go = "0.23"
-tree-sitter-cpp = "0.23"
-tree-sitter-ruby = "0.23"
 url = { version = "2.5.4", features = ["serde"] }
 backon = "1.5.2"
 eserde = "0.1.7"
@@ -106,17 +99,18 @@ uuid = { version = "1.18.0", features = [
 whoami = "1.6.1"
 fnv_rs = "0.4.3"
 merge = { version = "0.2", features = ["derive"] }
-rmcp = { version = "0.8.1", features = [
+rmcp = { version = "0.8.5", features = [
     "client",
     "transport-sse-client-reqwest",
     "transport-child-process",
+    "transport-streamable-http-client-reqwest",
 ] }
 open = "5.3.2"
 nucleo = "0.5.0"
 gray_matter = "0.3.2"
 num-format = "0.4"
 humantime = "2.1.0"
-
+dashmap = "7.0.0-rc2"
 
 # Internal crates
 forge_api = { path = "crates/forge_api" }
@@ -139,3 +133,4 @@ forge_tracker = { path = "crates/forge_tracker" }
 forge_walker = { path = "crates/forge_walker" }
 forge_json_repair = { path = "crates/forge_json_repair" }
 forge_select = { path = "crates/forge_select" }
+forge_test_kit = { path = "crates/forge_test_kit" }

@@ -5,13 +5,8 @@ use anyhow::Context;
 use forge_app::{EnvironmentInfra, FileReaderInfra, TemplateService};
 use forge_domain::Template;
 use futures::future;
-use handlebars::{Handlebars, no_escape};
-use rust_embed::Embed;
+use handlebars::Handlebars;
 use tokio::sync::RwLock;
-
-#[derive(Embed)]
-#[folder = "../../templates/"]
-struct Templates;
 
 #[derive(Clone)]
 pub struct ForgeTemplateService<F> {
@@ -21,13 +16,7 @@ pub struct ForgeTemplateService<F> {
 
 impl<F: EnvironmentInfra + FileReaderInfra> ForgeTemplateService<F> {
     pub fn new(infra: Arc<F>) -> Self {
-        let mut hb = Handlebars::new();
-        hb.set_strict_mode(true);
-        hb.register_escape_fn(no_escape);
-
-        // Register all partial templates
-        hb.register_embed_templates::<Templates>().unwrap();
-
+        let hb = forge_app::TemplateEngine::handlebar_instance();
         Self { hb: Arc::new(RwLock::new(hb)), infra }
     }
 
@@ -176,8 +165,8 @@ mod tests {
             },
             "current_time": "2024-01-01 12:00:00 UTC",
             "files": [
-                "/file1.txt",
-                "/file2.txt"
+                {"path": "file1.txt", "is_dir": false},
+                {"path": "file2.txt", "is_dir": false}
             ]
         });
 
@@ -188,7 +177,10 @@ mod tests {
             .unwrap();
 
         // Expected: Result should contain the rendered system info with substituted
+        // values
         assert!(actual.contains("<operating_system>test-os</operating_system>"));
+        assert!(actual.contains("file1.txt"));
+        assert!(actual.contains("file2.txt"));
     }
 
     #[test]

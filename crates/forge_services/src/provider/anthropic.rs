@@ -6,7 +6,8 @@ use forge_app::domain::{
     ChatCompletionMessage, Context, Model, ModelId, ResultStream, Transformer,
 };
 use forge_app::dto::anthropic::{
-    DropInvalidToolUse, EventData, ListModelResponse, ReasoningTransform, Request, SetCache,
+    AuthSystemMessage, DropInvalidToolUse, EventData, ListModelResponse, ReasoningTransform,
+    Request, SetCache,
 };
 use reqwest::Url;
 use tracing::debug;
@@ -20,8 +21,9 @@ pub struct Anthropic<T> {
     http: Arc<T>,
     api_key: String,
     chat_url: Url,
-    models: forge_domain::Models<Url>,
+    models: forge_domain::ModelSource<Url>,
     anthropic_version: String,
+    use_oauth: bool,
 }
 
 impl<H: HttpClientService> Anthropic<H> {
@@ -29,20 +31,42 @@ impl<H: HttpClientService> Anthropic<H> {
         http: Arc<H>,
         api_key: String,
         chat_url: Url,
-        models: forge_domain::Models<Url>,
+        models: forge_domain::ModelSource<Url>,
         version: String,
+        use_oauth: bool,
     ) -> Self {
-        Self { http, api_key, chat_url, models, anthropic_version: version }
+        Self {
+            http,
+            api_key,
+            chat_url,
+            models,
+            anthropic_version: version,
+            use_oauth,
+        }
     }
 
     fn get_headers(&self) -> Vec<(String, String)> {
-        vec![
-            ("x-api-key".to_string(), self.api_key.clone()),
-            (
-                "anthropic-version".to_string(),
-                self.anthropic_version.clone(),
-            ),
-        ]
+        let mut headers = vec![(
+            "anthropic-version".to_string(),
+            self.anthropic_version.clone(),
+        )];
+
+        // Use Authorization: Bearer for OAuth, x-api-key for API key auth
+        if self.use_oauth {
+            headers.push((
+                "authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ));
+            // OAuth requires multiple beta flags
+            headers.push((
+                "anthropic-beta".to_string(),
+                "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".to_string(),
+            ));
+        } else {
+            headers.push(("x-api-key".to_string(), self.api_key.clone()));
+        }
+
+        headers
     }
 }
 
@@ -58,11 +82,13 @@ impl<T: HttpClientService> Anthropic<T> {
 
         let request = Request::try_from(context)?
             .model(model.as_str().to_string())
-            .stream(true)
             .max_tokens(max_tokens as u64);
 
-        let request = DropInvalidToolUse.pipe(SetCache).transform(request);
-
+        let request = AuthSystemMessage::default()
+            .when(|_| self.use_oauth)
+            .pipe(DropInvalidToolUse)
+            .pipe(SetCache)
+            .transform(request);
         let url = &self.chat_url;
         debug!(url = %url, model = %model, "Connecting Upstream");
 
@@ -86,7 +112,7 @@ impl<T: HttpClientService> Anthropic<T> {
 
     pub async fn models(&self) -> anyhow::Result<Vec<Model>> {
         match &self.models {
-            forge_domain::Models::Url(url) => {
+            forge_domain::ModelSource::Url(url) => {
                 debug!(url = %url, "Fetching models");
 
                 let response = self
@@ -116,7 +142,7 @@ impl<T: HttpClientService> Anthropic<T> {
                         .with_context(|| "Failed to fetch the models")
                 }
             }
-            forge_domain::Models::Hardcoded(models) => {
+            forge_domain::ModelSource::Hardcoded(models) => {
                 debug!("Using hardcoded models");
                 Ok(models.clone())
             }
@@ -191,8 +217,9 @@ mod tests {
             Arc::new(MockHttpClient::new()),
             "sk-test-key".to_string(),
             chat_url,
-            forge_domain::Models::Url(model_url),
+            forge_domain::ModelSource::Url(model_url),
             "2023-06-01".to_string(),
+            false,
         ))
     }
 
@@ -241,11 +268,12 @@ mod tests {
             Arc::new(MockHttpClient::new()),
             "sk-some-key".to_string(),
             chat_url,
-            forge_domain::Models::Url(model_url.clone()),
+            forge_domain::ModelSource::Url(model_url.clone()),
             "v1".to_string(),
+            false,
         );
         match &anthropic.models {
-            forge_domain::Models::Url(url) => {
+            forge_domain::ModelSource::Url(url) => {
                 assert_eq!(url.as_str(), "https://api.anthropic.com/v1/models");
             }
             _ => panic!("Expected Models::Url variant"),

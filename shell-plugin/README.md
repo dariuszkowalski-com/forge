@@ -115,6 +115,34 @@ This displays:
 - Project details
 - Current configuration
 
+- Current configuration
+
+#### Cloning Conversations
+
+Create a copy of an existing conversation with interactive selection:
+
+```bash
+:clone
+```
+
+This will:
+- Display an interactive list of all conversations with preview
+- Allow you to select a conversation to clone
+- Create a new conversation with the same content
+- Automatically switch to the cloned conversation
+- Show the cloned conversation content and details
+
+You can also clone a specific conversation by providing its ID:
+
+```bash
+:clone <conversation_id>
+```
+
+This is useful when you want to:
+- Create a backup before making significant changes
+- Start a new conversation branch from an existing context
+- Experiment with different approaches while preserving the original
+
 #### Session Status
 
 The plugin automatically displays session information including:
@@ -145,6 +173,59 @@ export FORGE_BIN="/path/to/custom/forge"
 - `FORGE_BIN`: Path to the forge executable (default: `forge`)
 - Internal pattern matching for conversation syntax (`:`)
 - New session command keyword: `:new` or `:n`
+
+### Git Worktree Management
+
+Create new git worktrees with automatic directory structure:
+
+```bash
+# Basic usage
+:worktree my-feature
+:sandbox my-feature
+
+# With directory structure (creates parent directories automatically)
+:worktree feature/new-api
+:sandbox fix/bug-123
+:worktree hotfix/security-patch
+```
+
+This command will:
+
+- **Validate** that you're in a git repository
+- **Check** if the branch name is valid and doesn't already exist
+- **Create** parent directories automatically for structured branch names (e.g., `feature/`, `fix/`, `hotfix/`)
+- **Generate** a new git worktree at `../<branch-name>` or `../<category>/<branch-name>`
+- **Switch** to the newly created worktree directory
+- **Provide** clear error messages for validation failures
+
+**Use Cases:**
+- Isolated development environments for features
+- Bug fixes in separate worktrees
+- Hotfix branches with proper directory organization
+- Parallel development without context switching
+
+**Validation Features:**
+- Git repository verification
+- Branch name existence checking
+- Directory collision detection
+- Branch name format validation (alphanumeric, `/`, `_`, `-` only)
+- Automatic parent directory creation
+
+### Codebase Indexing
+
+Sync your codebase for semantic search:
+
+```bash
+:sync
+```
+
+This will index the current directory for semantic code search.
+
+### .forge Directory
+
+The plugin creates a `.forge` directory in your current working directory (similar to `.git`) for temporary files:
+
+- `FORGE_EDITMSG.md`: Temporary file used when opening an external editor with `:edit`
 
 ## Advanced Features
 
@@ -188,4 +269,27 @@ All transformed commands are properly saved to ZSH history, allowing you to:
 :info
 :new
 : New conversation starts here
+```
+
+### Git Worktree Examples
+
+```bash
+# Create a simple feature worktree
+:worktree user-authentication
+
+# Create structured worktree with automatic parent directory
+:sandbox feature/payment-integration
+
+# Create bug fix worktree
+:worktree fix/memory-leak
+
+# Create hotfix worktree
+:sandbox hotfix/critical-security
+```
+
+### Codebase Indexing
+
+```bash
+# Sync current directory for semantic search
+:sync
 ```

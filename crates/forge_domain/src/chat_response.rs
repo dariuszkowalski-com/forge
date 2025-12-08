@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use chrono::Local;
+
 use crate::{ToolCallFull, ToolName, ToolResult, Usage};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +118,7 @@ pub enum Category {
     Debug,
     Error,
     Completion,
+    Warning,
 }
 
 #[derive(Clone, derive_setters::Setters, Debug, PartialEq)]
@@ -124,6 +127,7 @@ pub struct TitleFormat {
     pub title: String,
     pub sub_title: Option<String>,
     pub category: Category,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 pub trait TitleExt {
@@ -146,6 +150,7 @@ impl TitleFormat {
             title: message.into(),
             sub_title: None,
             category: Category::Info,
+            timestamp: Local::now().into(),
         }
     }
 
@@ -155,6 +160,7 @@ impl TitleFormat {
             title: message.into(),
             sub_title: None,
             category: Category::Action,
+            timestamp: Local::now().into(),
         }
     }
 
@@ -163,6 +169,7 @@ impl TitleFormat {
             title: message.into(),
             sub_title: None,
             category: Category::Error,
+            timestamp: Local::now().into(),
         }
     }
 
@@ -171,14 +178,43 @@ impl TitleFormat {
             title: message.into(),
             sub_title: None,
             category: Category::Debug,
+            timestamp: Local::now().into(),
         }
     }
 
-    pub fn completion(message: impl Into<String>) -> Self {
+    pub fn warning(message: impl Into<String>) -> Self {
         Self {
             title: message.into(),
             sub_title: None,
-            category: Category::Completion,
+            category: Category::Warning,
+            timestamp: Local::now().into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_title_format_with_timestamp() {
+        let timestamp = DateTime::parse_from_rfc3339("2023-10-26T10:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let title = TitleFormat {
+            title: "Test Action".to_string(),
+            sub_title: Some("Subtitle".to_string()),
+            category: Category::Action,
+            timestamp,
+        };
+
+        assert_eq!(title.title, "Test Action");
+        assert_eq!(title.sub_title, Some("Subtitle".to_string()));
+        assert_eq!(title.category, Category::Action);
+        assert_eq!(title.timestamp, timestamp);
     }
 }

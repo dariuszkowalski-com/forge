@@ -6,10 +6,6 @@ use uuid::Uuid;
 
 use crate::{Context, Error, Metrics, Result};
 
-// Event type constants
-pub const EVENT_USER_TASK_INIT: &str = "user_task_init";
-pub const EVENT_USER_TASK_UPDATE: &str = "user_task_update";
-
 #[derive(Debug, Default, Display, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct ConversationId(Uuid);
@@ -59,7 +55,7 @@ impl MetaData {
 impl Conversation {
     pub fn new(id: ConversationId) -> Self {
         let created_at = Utc::now();
-        let metrics = Metrics::new().with_time(created_at);
+        let metrics = Metrics::default().started_at(created_at);
         Self {
             id,
             metrics,
@@ -94,31 +90,9 @@ impl Conversation {
     /// Returns a vector of user messages, selecting the first message from
     /// each consecutive sequence of user messages.
     pub fn first_user_messages(&self) -> Vec<&crate::ContextMessage> {
-        let context = match self.context.as_ref() {
-            Some(ctx) => ctx,
-            None => return Vec::new(),
-        };
-
-        let messages = &context.messages;
-        if messages.is_empty() {
-            return Vec::new();
-        }
-
-        let mut result = Vec::new();
-        let mut is_user = false;
-
-        for msg in messages {
-            if msg.has_role(crate::context::Role::User) {
-                // Only add the first message of each consecutive user sequence
-                if !is_user {
-                    result.push(msg);
-                    is_user = true;
-                }
-            } else {
-                is_user = false;
-            }
-        }
-
-        result
+        self.context
+            .as_ref()
+            .map(|ctx| ctx.first_user_messages())
+            .unwrap_or_default()
     }
 }

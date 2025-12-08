@@ -67,71 +67,49 @@ mod tests {
         let reasoning_details = vec![ReasoningFull {
             text: Some("I need to think about this carefully".to_string()),
             signature: None,
+            ..Default::default()
         }];
 
         Context::default()
             .reasoning(ReasoningConfig::default().enabled(true))
             .add_message(ContextMessage::user("User question", None))
-            .add_message(ContextMessage::Text(TextMessage {
-                raw_content: None,
-                role: Role::Assistant,
-                content: "First assistant response with reasoning".to_string(),
-                tool_calls: None,
-                model: None,
-                reasoning_details: Some(reasoning_details.clone()),
-            }))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::Assistant, "First assistant response with reasoning")
+                    .reasoning_details(reasoning_details.clone()),
+            ))
             .add_message(ContextMessage::user("Follow-up question", None))
-            .add_message(ContextMessage::Text(TextMessage {
-                raw_content: None,
-                role: Role::Assistant,
-                content: "Second assistant response with reasoning".to_string(),
-                tool_calls: None,
-                model: None,
-                reasoning_details: Some(reasoning_details.clone()),
-            }))
-            .add_message(ContextMessage::Text(TextMessage {
-                raw_content: None,
-                role: Role::Assistant,
-                content: "Third assistant without reasoning".to_string(),
-                tool_calls: None,
-                model: None,
-                reasoning_details: None,
-            }))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::Assistant, "Second assistant response with reasoning")
+                    .reasoning_details(reasoning_details.clone()),
+            ))
+            .add_message(ContextMessage::Text(TextMessage::new(
+                Role::Assistant,
+                "Third assistant without reasoning",
+            )))
     }
 
     fn create_context_first_assistant_no_reasoning() -> Context {
         let reasoning_details = vec![ReasoningFull {
             text: Some("Complex reasoning process".to_string()),
             signature: None,
+            ..Default::default()
         }];
 
         Context::default()
             .reasoning(ReasoningConfig::default().enabled(true))
             .add_message(ContextMessage::user("User message", None))
-            .add_message(ContextMessage::Text(TextMessage {
-                raw_content: None,
-                role: Role::Assistant,
-                content: "First assistant without reasoning".to_string(),
-                tool_calls: None,
-                model: None,
-                reasoning_details: None,
-            }))
-            .add_message(ContextMessage::Text(TextMessage {
-                raw_content: None,
-                role: Role::Assistant,
-                content: "Second assistant with reasoning".to_string(),
-                tool_calls: None,
-                model: None,
-                reasoning_details: Some(reasoning_details.clone()),
-            }))
-            .add_message(ContextMessage::Text(TextMessage {
-                raw_content: None,
-                role: Role::Assistant,
-                content: "Third assistant with reasoning".to_string(),
-                tool_calls: None,
-                model: None,
-                reasoning_details: Some(reasoning_details),
-            }))
+            .add_message(ContextMessage::Text(TextMessage::new(
+                Role::Assistant,
+                "First assistant without reasoning",
+            )))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::Assistant, "Second assistant with reasoning")
+                    .reasoning_details(reasoning_details.clone()),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::Assistant, "Third assistant with reasoning")
+                    .reasoning_details(reasoning_details),
+            ))
     }
 
     #[test]

@@ -9,7 +9,7 @@ mod fs_undo;
 mod image_read;
 mod plan_create;
 mod shell;
-mod syn;
+mod skill;
 
 pub use fetch::*;
 pub use followup::*;
@@ -22,3 +22,4 @@ pub use fs_undo::*;
 pub use image_read::*;
 pub use plan_create::*;
 pub use shell::*;
+pub use skill::*;

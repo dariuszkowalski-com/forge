@@ -5,6 +5,7 @@ use forge_app::dto::ToolsOverview;
 use forge_app::{User, UserUsage};
 use forge_domain::{AgentId, InitAuth, ModelId};
 use forge_stream::MpscStream;
+use futures::stream::BoxStream;
 use url::Url;
 
 use crate::*;
@@ -26,8 +27,20 @@ pub trait API: Sync + Send {
     /// Provides a list of providers available in the current environment
     async fn get_providers(&self) -> Result<Vec<AnyProvider>>;
 
+    /// Gets a provider by ID
+    async fn get_provider(&self, id: &ProviderId) -> Result<AnyProvider>;
+
     /// Executes a chat request and returns a stream of responses
     async fn chat(&self, chat: ChatRequest) -> Result<MpscStream<Result<ChatResponse>>>;
+
+    /// Commits changes with an AI-generated commit message
+    async fn commit(
+        &self,
+        preview: bool,
+        max_diff_size: Option<usize>,
+        diff: Option<String>,
+        additional_context: Option<String>,
+    ) -> Result<forge_app::CommitResult>;
 
     /// Returns the current environment
     fn environment(&self) -> Environment;
@@ -47,18 +60,6 @@ pub trait API: Sync + Send {
     /// If no path is provided, it will try to find forge.yaml in the current
     /// directory or its parent directories
     async fn read_merged(&self, path: Option<&Path>) -> Result<Workflow>;
-
-    /// Writes the given workflow to the specified path
-    /// If no path is provided, it will try to find forge.yaml in the current
-    /// directory or its parent directories
-    async fn write_workflow(&self, path: Option<&Path>, workflow: &Workflow) -> Result<()>;
-
-    /// Updates the workflow at the given path using the provided closure
-    /// If no path is provided, it will try to find forge.yaml in the current
-    /// directory or its parent directories
-    async fn update_workflow<F>(&self, path: Option<&Path>, f: F) -> Result<Workflow>
-    where
-        F: FnOnce(&mut Workflow) + Send;
 
     /// Returns the conversation with the given ID
     async fn conversation(&self, conversation_id: &ConversationId) -> Result<Option<Conversation>>;
@@ -140,17 +141,19 @@ pub trait API: Sync + Send {
     async fn get_default_model(&self) -> Option<ModelId>;
 
     /// Sets the operating model
-    async fn set_default_model(
-        &self,
-        agent_id: Option<AgentId>,
-        model_id: ModelId,
-    ) -> anyhow::Result<()>;
+    async fn set_default_model(&self, model_id: ModelId) -> anyhow::Result<()>;
 
     /// Refresh MCP caches by fetching fresh data
     async fn reload_mcp(&self) -> Result<()>;
 
     /// List of commands defined in .md file(s)
     async fn get_commands(&self) -> Result<Vec<Command>>;
+
+    /// List of available skills
+    async fn get_skills(&self) -> Result<Vec<Skill>>;
+
+    /// Generate a shell command from natural language prompt
+    async fn generate_command(&self, prompt: UserPrompt) -> Result<String>;
 
     /// Initiate provider auth flow
     async fn init_provider_auth(
@@ -166,4 +169,52 @@ pub trait API: Sync + Send {
         context: AuthContextResponse,
         timeout: std::time::Duration,
     ) -> Result<()>;
+
+    /// Remove provider credentials (logout)
+    async fn remove_provider(&self, provider_id: &ProviderId) -> Result<()>;
+
+    /// Sync a codebase directory for semantic search
+    async fn sync_codebase(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+    ) -> Result<MpscStream<Result<forge_domain::SyncProgress>>>;
+
+    /// Query the indexed codebase
+    async fn query_codebase(
+        &self,
+        path: PathBuf,
+        params: forge_domain::SearchParams<'_>,
+    ) -> Result<Vec<forge_domain::Node>>;
+
+    /// List all workspaces
+    async fn list_codebases(&self) -> Result<Vec<forge_domain::WorkspaceInfo>>;
+
+    /// Get workspace information for a specific path
+    async fn get_workspace_info(
+        &self,
+        path: PathBuf,
+    ) -> Result<Option<forge_domain::WorkspaceInfo>>;
+
+    /// Delete a workspace
+    async fn delete_codebase(&self, workspace_id: forge_domain::WorkspaceId) -> Result<()>;
+
+    /// Hydrates the gRPC channel
+    fn hydrate_channel(&self) -> Result<()>;
+
+    /// Check if authentication credentials exist
+    async fn is_authenticated(&self) -> Result<bool>;
+
+    /// Create new authentication credentials
+    async fn create_auth_credentials(&self) -> Result<forge_domain::WorkspaceAuth>;
+
+    /// Migrate environment variable-based credentials to file-based
+    /// credentials. This is a one-time migration that runs only if the
+    /// credentials file doesn't exist.
+    async fn migrate_env_credentials(&self) -> Result<Option<forge_domain::MigrationResult>>;
+
+    async fn generate_data(
+        &self,
+        data_parameters: DataGenerationParameters,
+    ) -> Result<BoxStream<'static, Result<serde_json::Value, anyhow::Error>>>;
 }
